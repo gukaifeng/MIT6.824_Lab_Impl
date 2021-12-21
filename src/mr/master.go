@@ -13,8 +13,8 @@ import (
 type Master struct {
 	files []string // partitioned files
 
-	mapStates    []State // map tasks status
-	reduceStates []State // reduce tasks status
+	mapStates    TasksState
+	reduceStates TasksState
 
 	timeOut int // timeout
 }
@@ -26,6 +26,13 @@ const (
 	PROCESSING
 	FINISHED
 )
+
+type TasksState struct {
+	states   []State
+	total    int
+	ptr      int
+	finished int
+}
 
 // RPC handlers for the worker to call.
 
@@ -42,44 +49,52 @@ func (m *Master) Assgin(args *Args, reply *Reply) error {
 		m.assginReduceTask(reply)
 	}
 
-	reply.NMap = len(m.mapStates)
-	reply.NReduce = len(m.reduceStates)
+	if reply.IsAssgined {
+		reply.NMap = m.mapStates.total
+		reply.NReduce = m.reduceStates.total
+	}
 
 	return nil
 }
 
 func (m *Master) FinishMap(args *Args, reply *Reply) error {
-	m.mapStates[args.SeqNum] = FINISHED
+	m.mapStates.states[args.SeqNum] = FINISHED
+	m.mapStates.finished++
 	return nil
 }
 
 func (m *Master) FinishReduce(args *Args, reply *Reply) error {
-	m.reduceStates[args.SeqNum] = FINISHED
+	m.reduceStates.states[args.SeqNum] = FINISHED
+	m.reduceStates.finished++
 	return nil
 }
 
 func (m *Master) assginMapTask(reply *Reply) {
-	for i := 0; i < len(m.mapStates); i++ {
-		if m.mapStates[i] == UNPROCESS {
+	ms := &m.mapStates
+	for i := 0; i < ms.total; i++ {
+		if ms.states[ms.ptr] == UNPROCESS {
 			reply.IsAssgined = true
-			reply.MapT.SeqNum = i
-			reply.MapT.PartitionedFile = m.files[i]
-			m.mapStates[i] = PROCESSING
-			go m.timeout(i, m.mapStates)
+			reply.MapT.SeqNum = ms.ptr
+			reply.MapT.PartitionedFile = m.files[ms.ptr]
+			ms.states[ms.ptr] = PROCESSING
+			go m.timeout(ms.ptr, ms.states)
 			break
 		}
+		ms.ptr = (ms.ptr + 1) % ms.total
 	}
 }
 
 func (m *Master) assginReduceTask(reply *Reply) {
-	for i := 0; i < len(m.reduceStates); i++ {
-		if m.reduceStates[i] == UNPROCESS {
+	rs := &m.reduceStates
+	for i := 0; i < rs.total; i++ {
+		if rs.states[rs.ptr] == UNPROCESS {
 			reply.IsAssgined = true
-			reply.ReduceT.SeqNum = i
-			m.reduceStates[i] = PROCESSING
-			go m.timeout(i, m.reduceStates)
+			reply.ReduceT.SeqNum = rs.ptr
+			rs.states[rs.ptr] = PROCESSING
+			go m.timeout(rs.ptr, rs.states)
 			break
 		}
+		rs.ptr = (rs.ptr + 1) % rs.total
 	}
 }
 
@@ -116,8 +131,8 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	if m.reduceDone() {
 		// delete all intermediate data
-		for i := 0; i < len(m.mapStates); i++ {
-			for j := 0; j < len(m.reduceStates); j++ {
+		for i := 0; i < m.mapStates.total; i++ {
+			for j := 0; j < m.reduceStates.total; j++ {
 				file := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(j)
 				os.Remove(file)
 			}
@@ -128,21 +143,11 @@ func (m *Master) Done() bool {
 }
 
 func (m *Master) mapDone() bool {
-	for i := 0; i < len(m.mapStates); i++ {
-		if m.mapStates[i] != FINISHED {
-			return false
-		}
-	}
-	return true
+	return m.mapStates.finished == m.mapStates.total
 }
 
 func (m *Master) reduceDone() bool {
-	for i := 0; i < len(m.reduceStates); i++ {
-		if m.reduceStates[i] != FINISHED {
-			return false
-		}
-	}
-	return true
+	return m.reduceStates.finished == m.reduceStates.total
 }
 
 //
@@ -153,8 +158,11 @@ func (m *Master) reduceDone() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{files: files}
 
-	m.mapStates = make([]State, len(files))
-	m.reduceStates = make([]State, nReduce)
+	m.mapStates.states = make([]State, len(files))
+	m.reduceStates.states = make([]State, nReduce)
+
+	m.mapStates.total = len(files)
+	m.reduceStates.total = nReduce
 
 	m.timeOut = 10 // unit: second
 
