@@ -29,7 +29,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
-// use ihash(key) % NReduce to choose the reduce
+// use ihash(key) % nReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 //
 func ihash(key string) int {
@@ -84,13 +84,13 @@ func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
 	defer file.Close()
 
 	kva := mapf(partitionedfile, string(content))
-	intermediate := make([][]KeyValue, reply.NReduce)
+	intermediate := make([][]KeyValue, reply.R)
 	for _, kv := range kva {
-		X := ihash(kv.Key) % reply.NReduce
+		X := ihash(kv.Key) % reply.R
 		intermediate[X] = append(intermediate[X], kv)
 	}
 
-	for i := 0; i < reply.NReduce; i++ {
+	for i := 0; i < reply.R; i++ {
 		// write intermediate file mr-X-Y, X is rap task num, Y is reduce task num
 		oname := "mr-" + strconv.Itoa(seqnum) + "-" + strconv.Itoa(i)
 		tmpfile, _ := ioutil.TempFile(".", oname+"-tmp-*")
@@ -109,7 +109,7 @@ func ExecReduceFunc(reply Reply, reducef func(string, []string) string) {
 	intermediate := []KeyValue{}
 	seqnum := reply.ReduceT.SeqNum
 
-	for i := 0; i < reply.NMap; i++ {
+	for i := 0; i < reply.M; i++ {
 		iname := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(seqnum)
 		ifile, _ := os.Open(iname)
 		dec := json.NewDecoder(ifile)

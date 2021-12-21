@@ -24,10 +24,10 @@ type Args struct {
 }
 
 type Reply struct {
-	NReduce    int // nReduce
-	NMap       int // nMap
 	MapT       MapTask
 	ReduceT    ReduceTask
+	M          int // the number of map tasks
+	R          int // the number of reduce tasks
 	IsAssgined bool
 	Finished   bool
 }
