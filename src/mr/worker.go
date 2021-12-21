@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"time"
 )
 
 //
@@ -53,6 +54,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if !reply.IsAssgined {
+			time.Sleep(time.Second)
 			continue
 		}
 
@@ -67,7 +69,6 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
-
 	seqnum := reply.MapT.SeqNum
 	partitionedfile := reply.MapT.PartitionedFile
 
@@ -79,7 +80,9 @@ func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
 	if err != nil {
 		log.Fatalf("cannot read %v", partitionedfile)
 	}
-	file.Close()
+
+	defer file.Close()
+
 	kva := mapf(partitionedfile, string(content))
 	intermediate := make([][]KeyValue, reply.NReduce)
 	for _, kv := range kva {
@@ -90,16 +93,16 @@ func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
 	for i := 0; i < reply.NReduce; i++ {
 		// write intermediate file mr-X-Y, X is rap task num, Y is reduce task num
 		oname := "mr-" + strconv.Itoa(seqnum) + "-" + strconv.Itoa(i)
-		ofile, _ := os.Create(oname)
-		enc := json.NewEncoder(ofile)
+		tmpfile, _ := ioutil.TempFile(".", oname+"-tmp-*")
+		enc := json.NewEncoder(tmpfile)
 		for _, kv := range intermediate[i] {
 			enc.Encode(&kv)
 		}
-		ofile.Close()
+
+		os.Rename(tmpfile.Name(), oname)
+		defer tmpfile.Close()
 	}
-	args := Args{SeqNum: seqnum}
-	reply2 := Reply{}
-	CallMaster("Master.FinishMap", &args, &reply2)
+	CallMaster("Master.FinishMap", &Args{SeqNum: seqnum}, nil)
 }
 
 func ExecReduceFunc(reply Reply, reducef func(string, []string) string) {
@@ -117,12 +120,13 @@ func ExecReduceFunc(reply Reply, reducef func(string, []string) string) {
 			}
 			intermediate = append(intermediate, kv)
 		}
+		defer ifile.Close()
 	}
 
 	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-" + strconv.Itoa(seqnum)
-	ofile, _ := os.Create(oname)
+	tmpfile, _ := ioutil.TempFile(".", oname+"-tmp-*")
 
 	i := 0
 	for i < len(intermediate) {
@@ -137,14 +141,15 @@ func ExecReduceFunc(reply Reply, reducef func(string, []string) string) {
 		output := reducef(intermediate[i].Key, values)
 
 		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		fmt.Fprintf(tmpfile, "%v %v\n", intermediate[i].Key, output)
 
 		i = j
 	}
 
-	args := Args{SeqNum: seqnum}
-	reply2 := Reply{}
-	CallMaster("Master.FinishReduce", &args, &reply2)
+	os.Rename(tmpfile.Name(), oname)
+	defer tmpfile.Close()
+
+	CallMaster("Master.FinishReduce", &Args{SeqNum: seqnum}, nil)
 }
 
 func CallMaster(rpcname string, args interface{}, reply interface{}) {
