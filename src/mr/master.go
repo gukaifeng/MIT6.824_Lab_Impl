@@ -13,7 +13,7 @@ import (
 
 type Master struct {
 	files        []string // partitioned files
-	timeOut      int      // timeout
+	timeOut      int
 	mapStates    TasksState
 	reduceStates TasksState
 }
@@ -27,23 +27,21 @@ const (
 )
 
 type TasksState struct {
-	states   []State
-	mutexes  []sync.RWMutex
-	total    int
-	ptr      int
-	finished int
+	states  []State
+	mutexes []sync.RWMutex
+	flags   struct{ ptr, finished, total int }
 }
 
 func (t *TasksState) GetFinished() int {
-	t.mutexes[t.total+1].RLock()
-	defer t.mutexes[t.total+1].RUnlock()
-	return t.finished
+	t.mutexes[t.flags.total+1].RLock()
+	defer t.mutexes[t.flags.total+1].RUnlock()
+	return t.flags.finished
 }
 
 func (t *TasksState) AddFinished() {
-	t.mutexes[t.total+1].Lock()
-	defer t.mutexes[t.total+1].Unlock()
-	t.finished++
+	t.mutexes[t.flags.total+1].Lock()
+	defer t.mutexes[t.flags.total+1].Unlock()
+	t.flags.finished++
 }
 
 func (t *TasksState) GetState(n int) State {
@@ -59,15 +57,15 @@ func (t *TasksState) ChangeState(n int, s State) {
 }
 
 func (t *TasksState) GetPtr() int {
-	t.mutexes[t.total].RLock()
-	defer t.mutexes[t.total].RUnlock()
-	return t.ptr
+	t.mutexes[t.flags.total].RLock()
+	defer t.mutexes[t.flags.total].RUnlock()
+	return t.flags.ptr
 }
 
 func (t *TasksState) AddPtr() {
-	t.mutexes[t.total].Lock()
-	defer t.mutexes[t.total].Unlock()
-	t.ptr = (t.ptr + 1) % t.total
+	t.mutexes[t.flags.total].Lock()
+	defer t.mutexes[t.flags.total].Unlock()
+	t.flags.ptr = (t.flags.ptr + 1) % t.flags.total
 }
 
 // RPC handlers for the worker to call.
@@ -85,8 +83,8 @@ func (m *Master) Assgin(args *Args, reply *Reply) error {
 	}
 
 	if reply.IsAssgined {
-		reply.M = m.mapStates.total
-		reply.R = m.reduceStates.total
+		reply.M = m.mapStates.flags.total
+		reply.R = m.reduceStates.flags.total
 	}
 
 	return nil
@@ -106,11 +104,11 @@ func (m *Master) FinishReduce(args *Args, reply *Reply) error {
 
 func (m *Master) assginMapTask(reply *Reply) {
 	ms := &m.mapStates
-	for i := 0; i < ms.total; i++ {
+	for i := 0; i < ms.flags.total; i++ {
 		if ms.GetState(ms.GetPtr()) == UNPROCESS {
 			reply.IsAssgined = true
 			reply.MapT.SeqNum = ms.GetPtr()
-			reply.MapT.PartitionedFile = m.files[ms.ptr]
+			reply.MapT.PartitionedFile = m.files[ms.flags.ptr]
 			ms.ChangeState(ms.GetPtr(), PROCESSING)
 			go m.timeout(ms.GetPtr(), ms)
 			break
@@ -121,7 +119,7 @@ func (m *Master) assginMapTask(reply *Reply) {
 
 func (m *Master) assginReduceTask(reply *Reply) {
 	rs := &m.reduceStates
-	for i := 0; i < rs.total; i++ {
+	for i := 0; i < rs.flags.total; i++ {
 		if rs.GetState(rs.GetPtr()) == UNPROCESS {
 			reply.IsAssgined = true
 			reply.ReduceT.SeqNum = rs.GetPtr()
@@ -166,8 +164,8 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 	if m.reduceDone() {
 		// delete all intermediate data
-		for i := 0; i < m.mapStates.total; i++ {
-			for j := 0; j < m.reduceStates.total; j++ {
+		for i := 0; i < m.mapStates.flags.total; i++ {
+			for j := 0; j < m.reduceStates.flags.total; j++ {
 				file := "mr-" + strconv.Itoa(i) + "-" + strconv.Itoa(j)
 				os.Remove(file)
 			}
@@ -178,11 +176,11 @@ func (m *Master) Done() bool {
 }
 
 func (m *Master) mapDone() bool {
-	return m.mapStates.GetFinished() == m.mapStates.total
+	return m.mapStates.GetFinished() == m.mapStates.flags.total
 }
 
 func (m *Master) reduceDone() bool {
-	return m.reduceStates.GetFinished() == m.reduceStates.total
+	return m.reduceStates.GetFinished() == m.reduceStates.flags.total
 }
 
 //
@@ -199,8 +197,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.mapStates.mutexes = make([]sync.RWMutex, len(files)+2) // the last 2 mutexes are for the ptr and finished variable
 	m.reduceStates.mutexes = make([]sync.RWMutex, nReduce+2)
 
-	m.mapStates.total = len(files)
-	m.reduceStates.total = nReduce
+	m.mapStates.flags.total = len(files)
+	m.reduceStates.flags.total = nReduce
 
 	m.timeOut = 10 // unit: second
 
