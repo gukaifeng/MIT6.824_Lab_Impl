@@ -27,52 +27,47 @@ const (
 )
 
 type TasksState struct {
-	states []State
-	// len(mutexes) = total + 2,
-	// mutexes[n] -> states[n],
-	// mutexes[total] -> ptr, mutexes[total+1] -> finished
-	mutexes  []sync.Mutex
+	states   []State
+	mutexes  []sync.RWMutex
 	total    int
 	ptr      int
 	finished int
 }
 
 func (t *TasksState) GetFinished() int {
-	t.mutexes[t.total+1].Lock()
-	f := t.finished
-	t.mutexes[t.total+1].Unlock()
-	return f
+	t.mutexes[t.total+1].RLock()
+	defer t.mutexes[t.total+1].RUnlock()
+	return t.finished
 }
 
 func (t *TasksState) AddFinished() {
 	t.mutexes[t.total+1].Lock()
+	defer t.mutexes[t.total+1].Unlock()
 	t.finished++
-	t.mutexes[t.total+1].Unlock()
 }
 
 func (t *TasksState) GetState(n int) State {
-	t.mutexes[n].Lock()
-	r := t.states[n]
-	t.mutexes[n].Unlock()
-	return r
+	t.mutexes[n].RLock()
+	defer t.mutexes[n].RUnlock()
+	return t.states[n]
 }
 
 func (t *TasksState) ChangeState(n int, s State) {
 	t.mutexes[n].Lock()
+	defer t.mutexes[n].Unlock()
 	t.states[n] = s
-	t.mutexes[n].Unlock()
 }
+
 func (t *TasksState) GetPtr() int {
-	t.mutexes[t.total].Lock()
-	p := t.ptr
-	t.mutexes[t.total].Unlock()
-	return p
+	t.mutexes[t.total].RLock()
+	defer t.mutexes[t.total].RUnlock()
+	return t.ptr
 }
 
 func (t *TasksState) AddPtr() {
 	t.mutexes[t.total].Lock()
+	defer t.mutexes[t.total].Unlock()
 	t.ptr = (t.ptr + 1) % t.total
-	t.mutexes[t.total].Unlock()
 }
 
 // RPC handlers for the worker to call.
@@ -201,8 +196,8 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.mapStates.states = make([]State, len(files))
 	m.reduceStates.states = make([]State, nReduce)
 
-	m.mapStates.mutexes = make([]sync.Mutex, len(files)+2) // the last 2 mutexes are for the ptr and finished variable
-	m.reduceStates.mutexes = make([]sync.Mutex, nReduce+2)
+	m.mapStates.mutexes = make([]sync.RWMutex, len(files)+2) // the last 2 mutexes are for the ptr and finished variable
+	m.reduceStates.mutexes = make([]sync.RWMutex, nReduce+2)
 
 	m.mapStates.total = len(files)
 	m.reduceStates.total = nReduce
