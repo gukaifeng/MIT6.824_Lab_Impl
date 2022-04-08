@@ -53,6 +53,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			break
 		}
 
+		// reply.IsAssgined may be false even if the MapReduce task is unfinished
+		// for example, all map tasks are in progress but unfinished, reduce tasks can't be started
+		// so, wait one second, and retry
 		if !reply.IsAssgined {
 			time.Sleep(time.Second)
 			continue
