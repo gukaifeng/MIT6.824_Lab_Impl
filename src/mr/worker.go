@@ -101,9 +101,8 @@ func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
 		for _, kv := range intermediate[i] {
 			enc.Encode(&kv)
 		}
-
 		os.Rename(tmpfile.Name(), oname)
-		defer tmpfile.Close()
+		tmpfile.Close()
 	}
 	CallMaster("Master.FinishMap", &Args{SeqNum: seqnum}, nil)
 }
@@ -123,7 +122,7 @@ func ExecReduceFunc(reply Reply, reducef func(string, []string) string) {
 			}
 			intermediate = append(intermediate, kv)
 		}
-		defer ifile.Close()
+		ifile.Close()
 	}
 
 	sort.Sort(ByKey(intermediate))

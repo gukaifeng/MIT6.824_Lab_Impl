@@ -94,18 +94,6 @@ func (m *Master) Assgin(args *Args, reply *Reply) error {
 	return nil
 }
 
-func (m *Master) FinishMap(args *Args, reply *Reply) error {
-	m.mapStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
-	m.mapStates.AddFinished()
-	return nil
-}
-
-func (m *Master) FinishReduce(args *Args, reply *Reply) error {
-	m.reduceStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
-	m.reduceStates.AddFinished()
-	return nil
-}
-
 func (m *Master) assginMapTask(reply *Reply) {
 	ms := &m.mapStates
 	for i := 0; i < ms.flags.total; i++ {
@@ -141,6 +129,18 @@ func (m *Master) timeout(n int, t *TasksState) {
 		}
 	}
 	t.ChangeState(n, PROCESSING, UNPROCESS, true)
+}
+
+func (m *Master) FinishMap(args *Args, reply *Reply) error {
+	m.mapStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
+	m.mapStates.AddFinished()
+	return nil
+}
+
+func (m *Master) FinishReduce(args *Args, reply *Reply) error {
+	m.reduceStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
+	m.reduceStates.AddFinished()
+	return nil
 }
 
 //
