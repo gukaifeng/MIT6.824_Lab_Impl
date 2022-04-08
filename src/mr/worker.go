@@ -87,14 +87,14 @@ func ExecMapFunc(reply Reply, mapf func(string, string) []KeyValue) {
 	defer file.Close()
 
 	kva := mapf(partitionedfile, string(content))
-	intermediate := make([][]KeyValue, reply.R)
+	intermediate := make([][]KeyValue, reply.R) // make R buckets
 	for _, kv := range kva {
 		X := ihash(kv.Key) % reply.R
 		intermediate[X] = append(intermediate[X], kv)
 	}
 
 	for i := 0; i < reply.R; i++ {
-		// write intermediate file mr-X-Y, X is rap task num, Y is reduce task num
+		// write intermediate file mr-X-Y, X is map task num, Y is reduce task num
 		oname := "mr-" + strconv.Itoa(seqnum) + "-" + strconv.Itoa(i)
 		tmpfile, _ := ioutil.TempFile(".", oname+"-tmp-*")
 		enc := json.NewEncoder(tmpfile)

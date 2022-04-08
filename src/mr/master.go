@@ -106,6 +106,8 @@ func (m *Master) assginMapTask(reply *Reply) {
 	ms := &m.mapStates
 	for i := 0; i < ms.flags.total; i++ {
 		if ms.GetState(ms.GetPtr()) == UNPROCESS {
+			// there is only one master (i.e. a single process) in this MapReduce framework,
+			// so the order of assignment of the following members is not important
 			reply.IsAssgined = true
 			reply.MapT.SeqNum = ms.GetPtr()
 			reply.MapT.PartitionedFile = m.files[ms.flags.ptr]
