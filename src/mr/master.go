@@ -50,22 +50,26 @@ func (t *TasksState) GetState(n int) State {
 	return t.states[n]
 }
 
-func (t *TasksState) ChangeState(n int, s State) {
+// change state s1 -> s2
+// if force is true, t.states[n] will be changed to s2 even if the original value was not s1
+// if force is false and the original value of t.states[n] is not s1, no changes will be made
+// return: whether the change have been applied
+func (t *TasksState) ChangeState(n int, s1 State, s2 State, force bool) bool {
 	t.mutexes[n].Lock()
 	defer t.mutexes[n].Unlock()
-	t.states[n] = s
+	if t.states[n] == s1 || force {
+		t.states[n] = s2
+		return true
+	}
+	return false
 }
 
-func (t *TasksState) GetPtr() int {
-	t.mutexes[t.flags.total].RLock()
-	defer t.mutexes[t.flags.total].RUnlock()
-	return t.flags.ptr
-}
-
-func (t *TasksState) AddPtr() {
+func (t *TasksState) GetAndAddPtr() int {
 	t.mutexes[t.flags.total].Lock()
 	defer t.mutexes[t.flags.total].Unlock()
+	p := t.flags.ptr
 	t.flags.ptr = (t.flags.ptr + 1) % t.flags.total
+	return p
 }
 
 // RPC handlers for the worker to call.
@@ -91,13 +95,13 @@ func (m *Master) Assgin(args *Args, reply *Reply) error {
 }
 
 func (m *Master) FinishMap(args *Args, reply *Reply) error {
-	m.mapStates.ChangeState(args.SeqNum, FINISHED)
+	m.mapStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
 	m.mapStates.AddFinished()
 	return nil
 }
 
 func (m *Master) FinishReduce(args *Args, reply *Reply) error {
-	m.reduceStates.ChangeState(args.SeqNum, FINISHED)
+	m.reduceStates.ChangeState(args.SeqNum, PROCESSING, FINISHED, true)
 	m.reduceStates.AddFinished()
 	return nil
 }
@@ -105,29 +109,27 @@ func (m *Master) FinishReduce(args *Args, reply *Reply) error {
 func (m *Master) assginMapTask(reply *Reply) {
 	ms := &m.mapStates
 	for i := 0; i < ms.flags.total; i++ {
-		if ms.GetState(ms.GetPtr()) == UNPROCESS {
+		p := ms.GetAndAddPtr()
+		if ms.ChangeState(p, UNPROCESS, PROCESSING, false) {
 			reply.IsAssgined = true
-			reply.MapT.SeqNum = ms.GetPtr()
-			reply.MapT.PartitionedFile = m.files[ms.flags.ptr]
-			ms.ChangeState(ms.GetPtr(), PROCESSING)
-			go m.timeout(ms.GetPtr(), ms)
+			reply.MapT.SeqNum = p
+			reply.MapT.PartitionedFile = m.files[p]
+			go m.timeout(p, ms)
 			break
 		}
-		ms.AddPtr()
 	}
 }
 
 func (m *Master) assginReduceTask(reply *Reply) {
 	rs := &m.reduceStates
 	for i := 0; i < rs.flags.total; i++ {
-		if rs.GetState(rs.GetPtr()) == UNPROCESS {
+		p := rs.GetAndAddPtr()
+		if rs.ChangeState(p, UNPROCESS, PROCESSING, false) {
 			reply.IsAssgined = true
-			reply.ReduceT.SeqNum = rs.GetPtr()
-			rs.ChangeState(rs.GetPtr(), PROCESSING)
-			go m.timeout(rs.GetPtr(), rs)
+			reply.ReduceT.SeqNum = p
+			go m.timeout(p, rs)
 			break
 		}
-		rs.AddPtr()
 	}
 }
 
@@ -138,7 +140,7 @@ func (m *Master) timeout(n int, t *TasksState) {
 			return
 		}
 	}
-	t.ChangeState(n, UNPROCESS)
+	t.ChangeState(n, PROCESSING, UNPROCESS, true)
 }
 
 //
