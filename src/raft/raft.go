@@ -59,18 +59,55 @@ const (
 )
 
 type elecTimer struct {
-	elapsed, timeout int // unit: ms
+	mu               sync.Mutex // for elapsed
+	elapsed, timeout int        // unit: ms
+}
+
+func (et *elecTimer) reset() {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	et.elapsed = 0
+}
+
+func (et *elecTimer) add() {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	et.elapsed++
+}
+
+func (et *elecTimer) timedout() bool {
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	return et.elapsed >= et.timeout
 }
 
 type voteInfo struct {
-	votedFor  int          // candidateId which this server voted for in current term, -1 means haven't voted yet
-	votedTerm int          // the last term votedFor
-	beVoted   int          // the number of votes received
-	mu        sync.RWMutex // rwmutex for beVoted
+	votedFor  int        // candidateId which this server voted for in current term, -1 means haven't voted yet
+	votedTerm int        // the last term votedFor
+	beVoted   int        // the number of votes received
+	muVoting  sync.Mutex // for votedTerm, i.e. the whole vote process
+	muVoted   sync.Mutex // for beVoted
+}
+
+func (vi *voteInfo) initVotes() {
+	vi.muVoted.Lock()
+	defer vi.muVoted.Unlock()
+	vi.beVoted = 1 // vote for self
+}
+
+func (vi *voteInfo) holdVotes() int {
+	vi.muVoted.Lock()
+	defer vi.muVoted.Unlock()
+	return vi.beVoted
+}
+
+func (vi *voteInfo) addVotes() {
+	vi.muVoted.Lock()
+	defer vi.muVoted.Unlock()
+	vi.beVoted++
 }
 
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -80,11 +117,44 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	es          elecState // current election state
-	currentTerm int       // current term
+	muState     sync.Mutex // Lock to protect shared access to this peer's state
+	muTerm      sync.Mutex // for currentTerm
+	muElect     sync.Mutex // // for electing
+	es          elecState  // current election state
+	currentTerm int        // current term
+	electing    bool       // whether the election going on
 	vi          voteInfo
 	et          elecTimer
-	electing    bool // whether the election going on
+}
+
+func (rf *Raft) getTerm() int {
+	rf.muTerm.Lock()
+	defer rf.muTerm.Unlock()
+	return rf.currentTerm
+}
+
+func (rf *Raft) addTerm() {
+	rf.muTerm.Lock()
+	defer rf.muTerm.Unlock()
+	rf.currentTerm++
+}
+
+func (rf *Raft) updateTerm(a int) {
+	rf.muTerm.Lock()
+	defer rf.muTerm.Unlock()
+	rf.currentTerm = a
+}
+
+func (rf *Raft) changeState(s elecState) {
+	rf.muState.Lock()
+	defer rf.muState.Unlock()
+	rf.es = s
+}
+
+func (rf *Raft) isState(s elecState) bool {
+	rf.muState.Lock()
+	defer rf.muState.Unlock()
+	return rf.es == s
 }
 
 // return currentTerm and whether this server
@@ -95,8 +165,19 @@ func (rf *Raft) GetState() (int, bool) {
 	// var isleader bool
 	// // Your code here (2A).
 	// return term, isleader
-	// fmt.Printf("id %v, term %v\n", rf.me, rf.currentTerm)
-	return rf.currentTerm, rf.es == LEADER
+	return rf.getTerm(), rf.isState(LEADER)
+}
+
+func (rf *Raft) inElection() bool {
+	rf.muElect.Lock()
+	defer rf.muElect.Unlock()
+	return rf.electing
+}
+
+func (rf *Raft) changeElection(a bool) {
+	rf.muElect.Lock()
+	defer rf.muElect.Unlock()
+	rf.electing = a
 }
 
 //
@@ -139,13 +220,13 @@ func (rf *Raft) readPersist(data []byte) {
 
 func (rf *Raft) kickOffElection() {
 	// transform state to condidate, and kick off a new election
-	rf.et.elapsed = 0
-	rf.es = CANDADITE
-	rf.currentTerm++
-	rf.vi.beVoted = 1 // vote for self
-	rf.electing = true
-	rvArgs := RequestVoteArgs{rf.currentTerm, rf.me}
-	for i := 0; i < len(rf.peers) && rf.electing; i++ {
+	rf.et.reset()
+	rf.changeState(CANDADITE)
+	rf.addTerm()
+	rf.vi.initVotes()
+	rf.changeElection(true)
+	rvArgs := RequestVoteArgs{rf.getTerm(), rf.me}
+	for i := 0; i < len(rf.peers) && rf.inElection(); i++ {
 		if i != rf.me {
 			go rf.sendAndReceiveRVRPC(i, &rvArgs)
 		}
@@ -161,17 +242,17 @@ func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs) {
 	}
 
 	if reply.VoteGranted {
-		rf.vi.beVoted++
-		if rf.electing && rf.vi.beVoted >= len(rf.peers)/2+1 { // received votes from the majority of servers
-			rf.es = LEADER
-			rf.et.elapsed = 0
-			rf.electing = false
+		rf.vi.addVotes()
+		if rf.inElection() && rf.vi.holdVotes() >= len(rf.peers)/2+1 { // received votes from the majority of servers
+			rf.changeState(LEADER)
+			rf.et.reset()
+			rf.changeElection(false)
 			go rf.heartbeat()
 		}
 	} else if reply.Term > rf.currentTerm {
-		rf.es = FOLLOWER
-		rf.currentTerm = reply.Term
-		rf.electing = false
+		rf.changeState(FOLLOWER)
+		rf.updateTerm(reply.Term)
+		rf.changeElection(false)
 	}
 }
 
@@ -182,9 +263,9 @@ func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs) {
 		// fmt.Println("sendAppendEntries() error")
 		return
 	}
-	if !reply.Success && rf.currentTerm < reply.Term {
-		rf.es = FOLLOWER
-		rf.currentTerm = reply.Term
+	if !reply.Success && rf.getTerm() < reply.Term {
+		rf.changeState(FOLLOWER)
+		rf.updateTerm(reply.Term)
 	}
 }
 
@@ -207,9 +288,9 @@ func (rf *Raft) heartbeat() {
 func (rf *Raft) timeout() {
 	for {
 		if _, s := rf.GetState(); !s { // this server believes it is the leader
-			if rf.et.elapsed < rf.et.timeout {
+			if !rf.et.timedout() {
 				time.Sleep(time.Millisecond)
-				rf.et.elapsed++
+				rf.et.add()
 				continue
 			}
 			go rf.kickOffElection()
@@ -253,26 +334,28 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if rf.vi.votedTerm < args.Term && // have already voted in the current term
-		(rf.es == FOLLOWER && rf.currentTerm <= args.Term) ||
-		(rf.es != FOLLOWER && rf.currentTerm < args.Term) {
-		rf.es = FOLLOWER
+	rf.vi.muVoting.Lock()
+	defer rf.vi.muVoting.Unlock()
+	if rf.vi.votedTerm < args.Term && // have not voted in the current term
+		((rf.isState(FOLLOWER) && rf.getTerm() <= args.Term) ||
+			(!rf.isState(FOLLOWER) && rf.getTerm() < args.Term)) {
+		rf.changeState(FOLLOWER)
+		rf.updateTerm(args.Term)
 		rf.vi.votedFor = args.CandidateId
 		rf.vi.votedTerm = args.Term
-		rf.currentTerm = args.Term
-		rf.et.elapsed = 0
+		rf.et.reset()
 		reply.VoteGranted = true
 	}
-	reply.Term = rf.currentTerm
+	reply.Term = rf.getTerm()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Term = rf.currentTerm
-	if args.Term >= rf.currentTerm {
-		rf.es = FOLLOWER
-		rf.currentTerm = args.Term
-		rf.electing = false
-		rf.et.elapsed = 0
+	reply.Term = rf.getTerm()
+	if args.Term >= rf.getTerm() {
+		rf.changeState(FOLLOWER)
+		rf.updateTerm(args.Term)
+		rf.changeElection(false)
+		rf.et.reset()
 	}
 }
 
