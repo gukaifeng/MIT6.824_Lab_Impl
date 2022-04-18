@@ -53,9 +53,9 @@ type ApplyMsg struct {
 type elecState int // state for leader election
 
 const (
-	LEADER elecState = iota
+	FOLLOWER elecState = iota
 	CANDADITE
-	FOLLOWER
+	LEADER
 )
 
 type elecTimer struct {
@@ -66,7 +66,6 @@ type voteInfo struct {
 	votedFor  int          // candidateId which this server voted for in current term, -1 means haven't voted yet
 	votedTerm int          // the last term votedFor
 	beVoted   int          // the number of votes received
-	elecBreak bool         // whether the election was broken, false indicate that this server is in election
 	mu        sync.RWMutex // rwmutex for beVoted
 }
 
@@ -85,6 +84,7 @@ type Raft struct {
 	currentTerm int       // current term
 	vi          voteInfo
 	et          elecTimer
+	electing    bool // whether the election going on
 }
 
 // return currentTerm and whether this server
@@ -139,50 +139,57 @@ func (rf *Raft) readPersist(data []byte) {
 
 func (rf *Raft) kickOffElection() {
 	// transform state to condidate, and kick off a new election
+	rf.et.elapsed = 0
 	rf.es = CANDADITE
 	rf.currentTerm++
 	rf.vi.beVoted = 1 // vote for self
-	rf.vi.elecBreak = false
-	// fmt.Printf("领导者 %v 发起了任期 %v 的选举\n", rf.me, rf.currentTerm)
+	rf.electing = true
 	rvArgs := RequestVoteArgs{rf.currentTerm, rf.me}
-	for i := 0; i < len(rf.peers) && !rf.vi.elecBreak; i++ {
-		if i == rf.me || rf.vi.beVoted >= len(rf.peers)/2+1 {
-			continue
+	for i := 0; i < len(rf.peers) && rf.electing; i++ {
+		if i != rf.me {
+			go rf.sendAndReceiveRVRPC(i, &rvArgs)
 		}
-		rvReply := RequestVoteReply{}
-		// go rf.sendRequestVote(i, &rvArgs, &rvReply)
-		go rf.sendAndReceiveRVRPC(i, &rvArgs, &rvReply)
 	}
 }
 
-func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	if rf.es == LEADER {
+func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs) {
+	reply := &RequestVoteReply{}
+	ok := rf.sendRequestVote(server, args, reply)
+	if !ok {
+		// fmt.Println("sendRequestVote() error")
 		return
 	}
 
-	rf.sendRequestVote(server, args, reply)
-
-	if !rf.vi.elecBreak && reply.VoteGranted {
+	if reply.VoteGranted {
 		rf.vi.beVoted++
-		// fmt.Printf("-- %d %d --\n", rf.me, rf.vi.beVoted)
-		if rf.es != LEADER && rf.vi.beVoted >= len(rf.peers)/2+1 { // received votes from the majority of servers
-			rf.vi.elecBreak = true
+		if rf.electing && rf.vi.beVoted >= len(rf.peers)/2+1 { // received votes from the majority of servers
 			rf.es = LEADER
 			rf.et.elapsed = 0
-			// t, s := rf.GetState()
-			// fmt.Printf("a leader elected, id %v, term %d, vote %d -- t %v, s %v\n", rf.me, rf.currentTerm, rf.vi.beVoted, t, s)
+			rf.electing = false
 			go rf.heartbeat()
 		}
-	}
-	if reply.Term > rf.currentTerm {
-		rf.currentTerm = reply.Term
+	} else if reply.Term > rf.currentTerm {
 		rf.es = FOLLOWER
+		rf.currentTerm = reply.Term
+		rf.electing = false
+	}
+}
+
+func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs) {
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, args, reply)
+	if !ok {
+		// fmt.Println("sendAppendEntries() error")
+		return
+	}
+	if !reply.Success && rf.currentTerm < reply.Term {
+		rf.es = FOLLOWER
+		rf.currentTerm = reply.Term
 	}
 }
 
 func (rf *Raft) heartbeat() {
 	for _, s := rf.GetState(); s; _, s = rf.GetState() {
-		// fmt.Printf("领导者 %v 发起了一轮心跳\n", rf.me)
 		args := AppendEntriesArgs{}
 		args.LeaderId = rf.me
 		args.Term = rf.currentTerm
@@ -190,27 +197,23 @@ func (rf *Raft) heartbeat() {
 			if i == rf.me {
 				continue
 			}
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(i, &args, &reply)
+			go rf.sendAndReceiveAERPC(i, &args)
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) timeout() {
 	for {
-		if _, s := rf.GetState(); s { // the server sees itself as the leader
-			// fmt.Println("im leader")
-			continue
+		if _, s := rf.GetState(); !s { // this server believes it is the leader
+			if rf.et.elapsed < rf.et.timeout {
+				time.Sleep(time.Millisecond)
+				rf.et.elapsed++
+				continue
+			}
+			go rf.kickOffElection()
 		}
-		if rf.et.elapsed < rf.et.timeout {
-			time.Sleep(time.Millisecond)
-			rf.et.elapsed++
-			continue
-		}
-		rf.et.elapsed = 0
-		go rf.kickOffElection()
 	}
 }
 
@@ -250,14 +253,15 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if rf.es == FOLLOWER &&
-		rf.currentTerm <= args.Term &&
-		rf.vi.votedTerm < args.Term {
-		reply.VoteGranted = true
+	if rf.vi.votedTerm < args.Term && // have already voted in the current term
+		(rf.es == FOLLOWER && rf.currentTerm <= args.Term) ||
+		(rf.es != FOLLOWER && rf.currentTerm < args.Term) {
+		rf.es = FOLLOWER
 		rf.vi.votedFor = args.CandidateId
 		rf.vi.votedTerm = args.Term
 		rf.currentTerm = args.Term
 		rf.et.elapsed = 0
+		reply.VoteGranted = true
 	}
 	reply.Term = rf.currentTerm
 }
@@ -265,10 +269,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
 	if args.Term >= rf.currentTerm {
-		// fmt.Printf("id %v 修改为追随者\n", rf.me)
 		rf.es = FOLLOWER
 		rf.currentTerm = args.Term
-		rf.vi.elecBreak = true
+		rf.electing = false
 		rf.et.elapsed = 0
 	}
 }
@@ -376,18 +379,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.es = FOLLOWER
-	rf.currentTerm = 0
 
-	// vote info
+	// initialize vote info
 	rf.vi.votedFor = -1
 	rf.vi.votedTerm = -1
-	rf.vi.elecBreak = true
 
-	// timer info
-	rf.et.elapsed = 0
-	rf.et.timeout = rand.Int()%300 + 100 // [500, 1500) ms
-	// fmt.Printf("raft me %v, timeout %v\n", me, rf.et.timeout)
+	// initialize timer info
+	rf.et.timeout = rand.Int()%200 + 300 // [300, 500) ms
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
