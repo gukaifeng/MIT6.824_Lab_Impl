@@ -107,6 +107,43 @@ func (vi *voteInfo) addVotes() {
 	vi.beVoted++
 }
 
+type logEntry struct {
+	Entry interface{}
+	Term  int
+	// Count     int
+	// Mu        sync.Mutex // for Count
+	// Committed bool
+}
+
+// func (e *logEntry) addCount() {
+// 	e.Mu.Lock()
+// 	defer e.Mu.Unlock()
+// 	e.Count++
+// }
+
+// func (e *logEntry) getCount() int {
+// 	e.Mu.Lock()
+// 	defer e.Mu.Unlock()
+// 	return e.Count
+// }
+
+type replicateCount struct {
+	count int
+	mu    sync.Mutex
+}
+
+func (rc *replicateCount) addCount() {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	rc.count++
+}
+
+func (rc *replicateCount) getCount() int {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.count
+}
+
 type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -117,15 +154,43 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	muState     sync.Mutex // Lock to protect shared access to this peer's state
+	muState sync.Mutex // Lock to protect shared access to this peer's state
+	es      elecState  // current election state
+
 	muTerm      sync.Mutex // for currentTerm
-	muElect     sync.Mutex // // for electing
-	es          elecState  // current election state
 	currentTerm int        // current term
-	electing    bool       // whether the election going on
-	vi          voteInfo
-	et          elecTimer
+
+	muElect  sync.Mutex // for electing
+	electing bool       // whether the election going on
+
+	vi voteInfo
+	et elecTimer
+
+	log []logEntry
+
+	commitIndex int
+	lastApplied int
+
+	applyCh chan ApplyMsg
 }
+
+// func (rf *Raft) addCount(i, a int) {
+// 	rf.muCounts[i].Lock()
+// 	defer rf.muCounts[i].Unlock()
+// 	rf.counts[i] += a
+// }
+
+// func (rf *Raft) setCount(i, a int) {
+// 	rf.muCounts[i].Lock()
+// 	defer rf.muCounts[i].Unlock()
+// 	rf.counts[i] = 0
+// }
+
+// func (rf *Raft) getCount(i, int) int {
+// 	rf.muCounts[i].Lock()
+// 	defer rf.muCounts[i].Unlock()
+// 	return rf.counts[i]
+// }
 
 func (rf *Raft) getTerm() int {
 	rf.muTerm.Lock()
@@ -256,16 +321,19 @@ func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs) {
 	}
 }
 
-func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs) {
+func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs, rc *replicateCount) {
 	reply := &AppendEntriesReply{}
+
 	ok := rf.sendAppendEntries(server, args, reply)
 	if !ok {
 		// fmt.Println("sendAppendEntries() error")
 		return
-	}
-	if !reply.Success && rf.getTerm() < reply.Term {
+	} else if !reply.Success && rf.getTerm() < reply.Term {
 		rf.changeState(FOLLOWER)
 		rf.updateTerm(reply.Term)
+	} else if reply.Success && rc != nil {
+		rc.addCount()
+		// fmt.Printf("rc %p rc add = %v\n", &rc, rc.getCount())
 	}
 }
 
@@ -278,7 +346,7 @@ func (rf *Raft) heartbeat() {
 			if i == rf.me {
 				continue
 			}
-			go rf.sendAndReceiveAERPC(i, &args)
+			go rf.sendAndReceiveAERPC(i, &args, nil)
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -320,8 +388,12 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      interface{}
+	Term         int // the entries in the same RPC have the same term
 }
 
 type AppendEntriesReply struct {
@@ -351,11 +423,37 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.getTerm()
+	// if args == nil {
+	// 	fmt.Println("AppendEntries args is nul, return")
+	// 	return
+	// }
 	if args.Term >= rf.getTerm() {
 		rf.changeState(FOLLOWER)
 		rf.updateTerm(args.Term)
 		rf.changeElection(false)
 		rf.et.reset()
+
+		if args.Entries != nil { // is not heartbeat
+			// check
+			lastLogIndex := len(rf.log) - 1
+			lastLogTerm := rf.log[lastLogIndex].Term
+			// fmt.Println("check fail")
+			// fmt.Printf("args.PIndex %v  lastLogIndex%v\n args.PTerm %v  lastLogTerm %v\n", args.PrevLogIndex, lastLogIndex, args.PrevLogTerm, lastLogTerm)
+			if !(args.PrevLogIndex == lastLogIndex &&
+				args.PrevLogTerm == lastLogTerm) {
+				return
+			}
+			// append
+			rf.log = append(rf.log, logEntry{args.Entries, args.Term})
+
+			// 假设已经提交
+			rf.commitIndex++
+			rf.applyCh <- ApplyMsg{true, args.Entries, rf.commitIndex}
+		}
+		reply.Success = true
+		// if args.Entries != nil {
+		// 	fmt.Println(args.Entries, reply.Success)
+		// }
 	}
 }
 
@@ -416,8 +514,51 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
 	// Your code here (2B).
+	if rf.isState(LEADER) {
+
+		args := AppendEntriesArgs{}
+		// check info
+		args.LeaderId = rf.me
+		args.PrevLogIndex = len(rf.log) - 1
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.LeaderCommit = rf.commitIndex
+
+		// entries info
+		curTerm := rf.getTerm()
+		args.Entries = command
+		args.Term = curTerm
+
+		rc := replicateCount{}
+		rc.addCount()
+
+		rf.log = append(rf.log, logEntry{command, curTerm})
+
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+
+			go rf.sendAndReceiveAERPC(i, &args, &rc)
+		}
+
+		for rc.getCount() < len(rf.peers)/2+1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// 应用到领导者状态机
+		//
+		// 提交
+		// rf.commitIndex += len(args.Entries)
+		rf.commitIndex++
+		rf.applyCh <- ApplyMsg{true, command, rf.commitIndex}
+		// 给其他服务器发送提交请求
+
+		// 更新返回值
+		index = rf.commitIndex
+		term = curTerm
+
+	}
 
 	return index, term, isLeader
 }
@@ -469,6 +610,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize timer info
 	rf.et.timeout = rand.Int()%200 + 300 // [300, 500) ms
+
+	rf.log = append(rf.log, logEntry{0, 0}) // initial consistency
+
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
