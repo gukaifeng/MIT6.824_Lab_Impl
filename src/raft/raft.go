@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -168,36 +167,52 @@ type Raft struct {
 	muBeLeader sync.Mutex // for the process of being leader
 	et         elecTimer
 
-	log      []logEntry
-	muAppend sync.Mutex // for append and start agreememt in the leader
+	log   []logEntry
+	muLog sync.Mutex // for append and start agreememt in the leader
 
-	nextIndex  []int
-	matchIndex []int
+	nextIndex    []int
+	matchIndex   []int
+	muAgreements []sync.Mutex
 
 	commitMu    sync.Mutex
 	commitIndex int
+
 	lastApplied int
 
 	applyCh chan ApplyMsg
 }
 
-// func (rf *Raft) addCount(i, a int) {
-// 	rf.muCounts[i].Lock()
-// 	defer rf.muCounts[i].Unlock()
-// 	rf.counts[i] += a
-// }
+// return: the index of the new log entry
+func (rf *Raft) appendLog(le logEntry) int {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	rf.log = append(rf.log, le)
+	return len(rf.log) - 1
+}
 
-// func (rf *Raft) setCount(i, a int) {
-// 	rf.muCounts[i].Lock()
-// 	defer rf.muCounts[i].Unlock()
-// 	rf.counts[i] = 0
-// }
+func (rf *Raft) getLogLen() int {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	return len(rf.log)
+}
 
-// func (rf *Raft) getCount(i, int) int {
-// 	rf.muCounts[i].Lock()
-// 	defer rf.muCounts[i].Unlock()
-// 	return rf.counts[i]
-// }
+func (rf *Raft) readLog(i int) (interface{}, int) {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	return rf.log[i].Entry, rf.log[i].Term
+}
+
+func (rf *Raft) trimRightLog(end int) {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	rf.log = rf.log[:end]
+}
+
+func (rf *Raft) getCommitIndex() int {
+	rf.commitMu.Lock()
+	defer rf.commitMu.Unlock()
+	return rf.commitIndex
+}
 
 func (rf *Raft) getTerm() int {
 	rf.muTerm.Lock()
@@ -290,15 +305,15 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-func (rf *Raft) kickOffElection() {
+func (rf *Raft) startElection() {
 	// transform state to condidate, and kick off a new election
 	// rf.et.reset()
 
 	rvArgs := RequestVoteArgs{}
 	rvArgs.CandidateId = rf.me
 	rvArgs.Term = rf.getTerm()
-	rvArgs.LastLogIndex = len(rf.log) - 1
-	rvArgs.LastLogTerm = rf.log[rvArgs.LastLogIndex].Term
+	rvArgs.LastLogIndex = rf.getLogLen() - 1
+	_, rvArgs.LastLogTerm = rf.readLog(rvArgs.LastLogIndex)
 	for i := 0; i < len(rf.peers) && rf.inElection(); i++ {
 		if i != rf.me {
 			go rf.sendAndReceiveRVRPC(i, &rvArgs)
@@ -327,9 +342,10 @@ func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs) {
 			rf.et.reset()
 
 			nServers := len(rf.peers)
-			nLogEntries := len(rf.log)
+			nLogEntries := rf.getLogLen()
 			rf.nextIndex = make([]int, nServers)
 			rf.matchIndex = make([]int, nServers)
+			rf.muAgreements = make([]sync.Mutex, nServers)
 			for i := 0; i < nServers; i++ {
 				rf.nextIndex[i] = nLogEntries
 			}
@@ -343,37 +359,24 @@ func (rf *Raft) sendAndReceiveRVRPC(server int, args *RequestVoteArgs) {
 	}
 }
 
-func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs, rc *replicateCount) {
-	if args.Entries == nil { // is heartbeat
-		reply := &AppendEntriesReply{}
-		var ok bool
-		if rf.isState(LEADER) {
-			ok = rf.sendAppendEntries(server, args, reply)
-		}
-
-		if ok && !reply.Success {
-			// fmt.Printf("领导者 %v 转为了追随者，任期由 %v 修改为 %v\n", rf.me, rf.getTerm(), reply.Term)
-			rf.changeState(FOLLOWER)
-			rf.updateTerm(reply.Term)
-		}
-		return
-	}
-	// fmt.Println("开始复制日志")
-	for rf.isState(LEADER) && rf.nextIndex[server] < len(rf.log) {
+// func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs, rc *replicateCount) {
+func (rf *Raft) sendReplication(server int, rc *replicateCount) {
+	rf.muAgreements[server].Lock()
+	defer rf.muAgreements[server].Unlock()
+	for rf.isState(LEADER) && rf.nextIndex[server] < rf.getLogLen() {
 		args := &AppendEntriesArgs{}
-		args.LeaderCommit = rf.commitIndex
+		args.LeaderCommit = rf.getCommitIndex()
 		args.LeaderId = rf.me
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-		args.Entries = rf.log[rf.nextIndex[server]].Entry
-		args.Term = rf.log[rf.nextIndex[server]].Term
+		_, args.PrevLogTerm = rf.readLog(args.PrevLogIndex)
+		args.Entries, args.Term = rf.readLog(rf.nextIndex[server])
 		// fmt.Printf("领导者 %v 正在给追随者 %v 发送索引为 %v 的条目 %v， 当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getTerm())
 
 		reply := &AppendEntriesReply{}
 
 		ok := rf.sendAppendEntries(server, args, reply)
 		if !ok {
-			return
+			continue // retry
 		}
 
 		if reply.Success {
@@ -388,13 +391,10 @@ func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs, rc *rep
 			}
 			rf.nextIndex[server]--
 			// fmt.Printf("任期 %v 的领导者 %v 减小了追随者 %v 的 nextIndex，当前 nextIndex = %v\n", rf.getTerm(), rf.me, server, rf.nextIndex[server])
-			fmt.Printf("%v %v %v\n", rf.isState(LEADER), rf.nextIndex[server], len(rf.log))
+			// fmt.Printf("%v %v %v\n", rf.isState(LEADER), rf.nextIndex[server], len(rf.log))
 		}
-
 	}
-	// if rf.isState(LEADER) {
 	rc.addCount()
-	// }
 }
 
 func (rf *Raft) heartbeat() {
@@ -402,21 +402,28 @@ func (rf *Raft) heartbeat() {
 		// fmt.Printf("领导者 %v 发起了一轮心跳，其任期为 %v\n", rf.me, rf.getTerm())
 		args := AppendEntriesArgs{}
 		args.LeaderId = rf.me
-		args.PrevLogIndex = len(rf.log) - 1
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-		// rf.commitMu.Lock()
-		args.LeaderCommit = rf.commitIndex // it must be less than or equal to PrevLogIndex
-		// rf.commitMu.Unlock()
+		args.PrevLogIndex = rf.getLogLen() - 1
+		_, args.PrevLogTerm = rf.readLog(args.PrevLogIndex)
+		args.LeaderCommit = rf.getCommitIndex() // it must be less than or equal to PrevLogIndex
 		args.Term = rf.getTerm()
 
 		for i := 0; i < len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
-			go rf.sendAndReceiveAERPC(i, &args, nil)
+			go rf.sendHeartbeat(i, &args)
 		}
-
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, args, reply)
+	if ok && !reply.Success {
+		// fmt.Printf("领导者 %v 转为了追随者，任期由 %v 修改为 %v\n", rf.me, rf.getTerm(), reply.Term)
+		rf.changeState(FOLLOWER)
+		rf.updateTerm(reply.Term)
 	}
 }
 
@@ -436,7 +443,7 @@ func (rf *Raft) timeout() {
 			rf.vi.initVotes()
 			rf.changeElection(true)
 			// fmt.Printf("候选者 %v 发起了任期 %v 的选举，当前其是不是领导者 %v\n", rf.me, rf.getTerm(), rf.isState(LEADER))
-			go rf.kickOffElection()
+			go rf.startElection()
 		}
 	}
 }
@@ -483,8 +490,8 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.getLogLen() - 1
+	_, lastLogTerm := rf.readLog(lastLogIndex)
 
 	rf.vi.muVoting.Lock()
 	defer rf.vi.muVoting.Unlock()
@@ -504,66 +511,49 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.getTerm()
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	lastLogIndex := rf.getLogLen() - 1
+	_, lastLogTerm := rf.readLog(lastLogIndex)
 	// fmt.Printf("服务器 %v 收到 %v 任期的 RPC，自己任期 %v 的RPC\n", rf.me, args.Term, rf.getTerm())
-	if args.Term >= lastLogTerm {
-		// if rf.isState(LEADER) {
-		// 	fmt.Printf("服务器 %v 卸任任期 %v 的领导者\n", rf.me, rf.getTerm())
-		// }
-		// if args.Term < rf.getTerm() {
-		// 	fmt.Printf("服务器 %v 减小其任期至 %v\n", rf.me, args.Term)
-		// }
-		rf.changeState(FOLLOWER)
-		rf.updateTerm(args.Term)
-		rf.changeElection(false)
-		rf.et.reset()
 
-		// if args.Entries == nil { // this rpc is heartbeat
-		// 	reply.Success = true
-		// 	return
-		// }
-		if args.Entries != nil {
-
-			// check for append and commit
-			lastLogIndex := len(rf.log) - 1
-			lastLogTerm := rf.log[lastLogIndex].Term
-
-			// fmt.Printf("追随者 %v 收到来自领导者 %v 的上一个索引为 %v 的 append，其自己的 lastIndex 是 %v \n", rf.me, args.LeaderId, args.PrevLogIndex, lastLogIndex)
-			if lastLogIndex < args.PrevLogIndex { // 这个追随者前面缺日志
-				return
-			} else if lastLogIndex > args.PrevLogIndex { // 这个追随者的日志比当前领导者的长，把后面的都删了
-				rf.log = rf.log[:args.PrevLogIndex+1]
-				lastLogIndex = len(rf.log) - 1
-				lastLogTerm = rf.log[lastLogIndex].Term
-			}
-
-			// now lastLogIndex == args.PrevLogIndex
-			if lastLogTerm != args.PrevLogTerm { // 日志长度相同，但任期不同
-				return
-			}
-
-			// if !(args.PrevLogIndex == lastLogIndex &&
-			// 	args.PrevLogTerm == lastLogTerm) {
-			// 	return
-			// }
-
-			// if args.Entries != nil {
-			rf.log = append(rf.log, logEntry{args.Entries, args.Term})
-			// fmt.Printf("追随者 %v 追加了 %v，当前日志长度 %v，当前任期 %v\n", rf.me, args.Entries, len(rf.log), args.Term)
-			// }
-		}
-
-		rf.commitMu.Lock()
-		defer rf.commitMu.Unlock()
-		for ; rf.commitIndex < args.LeaderCommit && rf.commitIndex+1 < len(rf.log); rf.commitIndex++ {
-			// fmt.Printf("rf.commitIndex + 1 = %v, len(rf.log) = %v\n", rf.commitIndex+1, len(rf.log))
-			rf.applyCh <- ApplyMsg{true, rf.log[rf.commitIndex+1].Entry, rf.commitIndex + 1}
-			// fmt.Printf("追随者 %v 提交并应用了 %v, 当前日志长度 %v，当前 commitIndex %v\n", rf.me, rf.log[rf.commitIndex+1].Entry, len(rf.log), rf.commitIndex+1)
-		}
-
-		reply.Success = true
+	if args.Term < lastLogTerm {
+		return // invaild rpc
 	}
+
+	rf.changeState(FOLLOWER)
+	rf.updateTerm(args.Term)
+	rf.changeElection(false)
+	rf.et.reset()
+
+	if args.Entries != nil {
+		// check for append and commit
+		// fmt.Printf("追随者 %v 收到来自领导者 %v 的上一个索引为 %v 的 append，其自己的 lastIndex 是 %v \n", rf.me, args.LeaderId, args.PrevLogIndex, lastLogIndex)
+		if lastLogIndex < args.PrevLogIndex { // 这个追随者前面缺日志
+			return
+		} else if lastLogIndex > args.PrevLogIndex { // 这个追随者的日志比当前领导者的长，把后面的都删了
+			rf.trimRightLog(args.PrevLogIndex + 1)
+			lastLogIndex = rf.getLogLen() - 1
+			_, lastLogTerm = rf.readLog(lastLogIndex)
+		}
+
+		// now lastLogIndex == args.PrevLogIndex
+		if lastLogTerm != args.PrevLogTerm { // 日志长度相同，但任期不同
+			return
+		}
+
+		rf.appendLog(logEntry{args.Entries, args.Term})
+		// fmt.Printf("追随者 %v 追加了 %v，当前日志长度 %v，当前任期 %v\n", rf.me, args.Entries, len(rf.log), args.Term)
+	}
+
+	rf.commitMu.Lock()
+	defer rf.commitMu.Unlock()
+	for ; rf.commitIndex < args.LeaderCommit && rf.commitIndex+1 < rf.getLogLen(); rf.commitIndex++ {
+		// fmt.Printf("rf.commitIndex + 1 = %v, len(rf.log) = %v\n", rf.commitIndex+1, len(rf.log))
+		e, _ := rf.readLog(rf.commitIndex + 1)
+		rf.applyCh <- ApplyMsg{true, e, rf.commitIndex + 1}
+		// fmt.Printf("追随者 %v 提交并应用了 %v, 当前日志长度 %v，当前 commitIndex %v\n", rf.me, rf.log[rf.commitIndex+1].Entry, len(rf.log), rf.commitIndex+1)
+	}
+
+	reply.Success = true
 }
 
 //
@@ -643,7 +633,7 @@ func (rf *Raft) startAgreement(index int, command interface{}, rc *replicateCoun
 		if i == rf.me {
 			continue
 		}
-		go rf.sendAndReceiveAERPC(i, &args, rc)
+		go rf.sendReplication(i, rc)
 	}
 
 	// go rf.execReplicate(command, &rc)
@@ -654,7 +644,8 @@ func (rf *Raft) startAgreement(index int, command interface{}, rc *replicateCoun
 	rf.commitMu.Lock()
 	defer rf.commitMu.Unlock()
 	for rf.commitIndex < index {
-		rf.applyCh <- ApplyMsg{true, rf.log[rf.commitIndex+1].Entry, rf.commitIndex + 1}
+		e, _ := rf.readLog(rf.commitIndex + 1)
+		rf.applyCh <- ApplyMsg{true, e, rf.commitIndex + 1}
 		rf.commitIndex++
 		// fmt.Printf("领导者 %v 提交并应用了 %v, 当前日志长度 %v, 当前 commitIndex %v\n", rf.me, command, len(rf.log), rf.commitIndex)
 	}
@@ -667,24 +658,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 	// Your code here (2B).
 	if rf.isState(LEADER) {
-
 		rc := replicateCount{}
 		rc.addCount()
-
-		rf.muAppend.Lock()
-		defer rf.muAppend.Unlock()
-		index1 := len(rf.log)
-		rf.log = append(rf.log, logEntry{command, rf.getTerm()})
-
+		index1 := rf.appendLog(logEntry{command, rf.getTerm()})
 		// fmt.Printf("领导者 %v 追加了 %v，当前任期 %v\n", rf.me, command, rf.getTerm())
-
 		go rf.startAgreement(index1, command, &rc)
 
 		index = index1
 		term = rf.getTerm()
-
 	}
-
 	return index, term, isLeader
 }
 
@@ -736,7 +718,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize timer info
 	rf.et.timeout = rand.Int()%200 + 300 // [300, 500) ms
 
-	rf.log = append(rf.log, logEntry{0, 0}) // initial consistency
+	rf.log = append(rf.log, logEntry{0, 0}) // initial consistency, the lock is unnecessary
 
 	rf.applyCh = applyCh
 
