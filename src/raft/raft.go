@@ -55,9 +55,9 @@ const (
 )
 
 const (
-	ELECT_TIMEOUT_LEFT = 300 // unit: ms
-	ELECT_TIMEOUT_SPAN = 200
-	HEARTBEAT_INTERVAL = 180
+	ELECT_TIMEOUT_LEFT = 150 // unit: ms
+	ELECT_TIMEOUT_SPAN = 150
+	HEARTBEAT_INTERVAL = 100
 )
 
 func Min(a, b int) int {
@@ -89,28 +89,6 @@ type Raft struct {
 	currentTerm   int
 	muCurrentTerm sync.Mutex
 
-	log   []logEntry
-	muLog sync.Mutex // mutex for append and start agreememt in the leader
-
-	nextIndex    []int
-	matchIndex   []int
-	muAgreements []sync.Mutex
-
-	commitMu    sync.Mutex
-	commitIndex int
-
-	muApply     sync.Mutex
-	lastApplied int
-	applyCh     chan ApplyMsg
-
-	// election timer
-	electTicker  *time.Ticker
-	electTimeout time.Duration
-
-	// heartbeat timer
-	heartbeatTicker   *time.Ticker
-	heartbeatInterval time.Duration
-
 	// vote grant info
 	votedFor    int        // candidateId which this server voted for in current term, -1 means haven't voted yet
 	muVotedFor  sync.Mutex // mutex for votedFor
@@ -121,6 +99,31 @@ type Raft struct {
 	muNumVotes sync.Mutex // mutex for numVotes
 	muBeLeader sync.Mutex // mutex for the process of being a leader
 
+	// log
+	log   []logEntry
+	muLog sync.Mutex // mutex for append and start agreememt in the leader
+
+	// the leader maintains for the followers
+	nextIndex    []int
+	matchIndex   []int
+	muAgreements []sync.Mutex
+
+	// commit
+	commitIndex   int
+	muCommitIndex sync.Mutex
+
+	// apply
+	lastApplied int
+	muApply     sync.Mutex
+	applyCh     chan ApplyMsg
+
+	// election timer
+	electTicker  *time.Ticker
+	electTimeout time.Duration
+
+	// heartbeat timer
+	heartbeatTicker   *time.Ticker
+	heartbeatInterval time.Duration
 }
 
 func (rf *Raft) setVotedFor(a int) {
@@ -172,6 +175,22 @@ func (rc *replicateCount) getCount() int {
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
 	return rc.count
+}
+
+func (rf *Raft) apply() {
+	rf.muApply.Lock()
+	defer rf.muApply.Unlock()
+	for ; rf.lastApplied < rf.getCommitIndex(); rf.lastApplied++ {
+		// DPrintf("== %v %v ==", rf.lastApplied, rf.commitIndex)
+		e, _ := rf.readLog(rf.lastApplied + 1)
+		rf.applyCh <- ApplyMsg{true, e, rf.lastApplied + 1}
+		if rf.isState(LEADER) {
+			DPrintf("领导者 ")
+		} else {
+			DPrintf("追随者 ")
+		}
+		DPrintf("%v 应用了索引 %v 处的 %v，当前日志长度 %v，当前 commitIndex 为 %v，当前任期 %v\n", rf.me, rf.lastApplied+1, e, rf.getLogLen(), rf.getCommitIndex(), rf.getCurrentTerm())
+	}
 }
 
 //
@@ -239,14 +258,14 @@ func (rf *Raft) trimRightLog(end int) {
 }
 
 func (rf *Raft) getCommitIndex() int {
-	rf.commitMu.Lock()
-	defer rf.commitMu.Unlock()
+	rf.muCommitIndex.Lock()
+	defer rf.muCommitIndex.Unlock()
 	return rf.commitIndex
 }
 
 func (rf *Raft) setCommitIndex(a int) {
-	rf.commitMu.Lock()
-	defer rf.commitMu.Unlock()
+	rf.muCommitIndex.Lock()
+	defer rf.muCommitIndex.Unlock()
 	rf.commitIndex = a
 }
 
@@ -641,22 +660,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-
-func (rf *Raft) apply() {
-	rf.muApply.Lock()
-	defer rf.muApply.Unlock()
-	for ; rf.lastApplied < rf.getCommitIndex(); rf.lastApplied++ {
-		// DPrintf("== %v %v ==", rf.lastApplied, rf.commitIndex)
-		e, _ := rf.readLog(rf.lastApplied + 1)
-		rf.applyCh <- ApplyMsg{true, e, rf.lastApplied + 1}
-		if rf.isState(LEADER) {
-			DPrintf("领导者 ")
-		} else {
-			DPrintf("追随者 ")
-		}
-		DPrintf("%v 应用了索引 %v 处的 %v，当前日志长度 %v，当前 commitIndex 为 %v，当前任期 %v\n", rf.me, rf.lastApplied+1, e, rf.getLogLen(), rf.getCommitIndex(), rf.getCurrentTerm())
-	}
-}
 
 func (rf *Raft) startAgreement(index int, command interface{}, rc *replicateCount) {
 
