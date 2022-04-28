@@ -100,13 +100,15 @@ type Raft struct {
 	muBeLeader sync.Mutex // mutex for the process of being a leader
 
 	// log
-	log   []logEntry
-	muLog sync.Mutex // mutex for append and start agreememt in the leader
+	log     []logEntry
+	muLog   sync.Mutex // mutex for append and start agreememt in the leader
+	muStart sync.Mutex
 
 	// the leader maintains for the followers
 	nextIndex    []int
 	matchIndex   []int
 	muAgreements []sync.Mutex
+	muAgreement  sync.Mutex
 
 	// commit
 	commitIndex   int
@@ -118,12 +120,42 @@ type Raft struct {
 	applyCh     chan ApplyMsg
 
 	// election timer
-	electTicker  *time.Ticker
-	electTimeout time.Duration
+	electTicker   *time.Ticker
+	muElectTicker sync.Mutex
+	electTimeout  time.Duration
 
 	// heartbeat timer
 	heartbeatTicker   *time.Ticker
+	muHeartbeatTicker sync.Mutex
 	heartbeatInterval time.Duration
+}
+
+func (rf *Raft) newElectTicker() {
+	rf.muElectTicker.Lock()
+	defer rf.muElectTicker.Unlock()
+	rf.electTicker = time.NewTicker(rf.electTimeout)
+}
+
+func (rf *Raft) resetElectTicker() {
+	rf.muElectTicker.Lock()
+	defer rf.muElectTicker.Unlock()
+	rf.electTicker.Reset(rf.electTimeout)
+}
+
+func (rf *Raft) newHeartbeatTicker() {
+	rf.muHeartbeatTicker.Lock()
+	defer rf.muHeartbeatTicker.Unlock()
+	rf.heartbeatTicker = time.NewTicker(rf.heartbeatInterval)
+}
+func (rf *Raft) stopHeartbeatTicker() {
+	rf.muHeartbeatTicker.Lock()
+	defer rf.muHeartbeatTicker.Unlock()
+	rf.heartbeatTicker.Stop()
+}
+func (rf *Raft) heartbeatTimeout() {
+	rf.muHeartbeatTicker.Lock()
+	defer rf.muHeartbeatTicker.Unlock()
+	<-rf.heartbeatTicker.C
 }
 
 func (rf *Raft) setVotedFor(a int) {
@@ -182,7 +214,7 @@ func (rf *Raft) apply() {
 	defer rf.muApply.Unlock()
 	for ; rf.lastApplied < rf.getCommitIndex(); rf.lastApplied++ {
 		// DPrintf("== %v %v ==", rf.lastApplied, rf.commitIndex)
-		e, _ := rf.readLog(rf.lastApplied + 1)
+		e := rf.readLog(rf.lastApplied + 1).Entry
 		rf.applyCh <- ApplyMsg{true, e, rf.lastApplied + 1}
 		if rf.isState(LEADER) {
 			DPrintf("领导者 ")
@@ -221,9 +253,10 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	Entries      interface{}
-	EntriesT     int
-	Term         int // the entries in the same RPC have the same term
+	// Entries      interface{}
+	// EntriesT     int
+	Entries []logEntry
+	Term    int // the entries in the same RPC have the same term
 }
 
 type AppendEntriesReply struct {
@@ -245,10 +278,15 @@ func (rf *Raft) getLogLen() int {
 	return len(rf.log)
 }
 
-func (rf *Raft) readLog(i int) (interface{}, int) {
+// func (rf *Raft) readLog(i int) (interface{}, int) {
+// 	rf.muLog.Lock()
+// 	defer rf.muLog.Unlock()
+// 	return rf.log[i].Entry, rf.log[i].Term
+// }
+func (rf *Raft) readLog(i int) logEntry {
 	rf.muLog.Lock()
 	defer rf.muLog.Unlock()
-	return rf.log[i].Entry, rf.log[i].Term
+	return rf.log[i]
 }
 
 func (rf *Raft) trimRightLog(end int) {
@@ -266,6 +304,7 @@ func (rf *Raft) getCommitIndex() int {
 func (rf *Raft) setCommitIndex(a int) {
 	rf.muCommitIndex.Lock()
 	defer rf.muCommitIndex.Unlock()
+	DPrintf("服务器 %v commitIndex 由 %v 修改为 %v", rf.me, rf.commitIndex, a)
 	rf.commitIndex = a
 }
 
@@ -390,27 +429,42 @@ func (rf *Raft) startRequestVote(server int, args *RequestVoteArgs) {
 
 // func (rf *Raft) sendAndReceiveAERPC(server int, args *AppendEntriesArgs, rc *replicateCount) {
 func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
-	rf.muAgreements[server].Lock()
-	defer rf.muAgreements[server].Unlock()
-
+	// rf.muAgreements[server].Lock()
+	// defer rf.muAgreements[server].Unlock()
+	DPrintf("领导者 %v 开始追随者 %v 在索引 %v 的条目 %v 的一致性", rf.me, server, index, rf.readLog(index).Entry)
 	if !rf.isState(LEADER) || index > rf.getLogLen()-1 {
 		return
 	}
 
-	_, entryTerm := rf.readLog(index)
+	// _, entryTerm := rf.readLog(index)
+	entryTerm := rf.readLog(index).Term
 
 	args := &AppendEntriesArgs{}
 	args.LeaderId = rf.me
 	args.Term = rf.getCurrentTerm()
 	args.LeaderCommit = rf.getCommitIndex()
 
+	for i := index; i > rf.nextIndex[server]; i-- {
+		args.Entries = append(args.Entries, rf.readLog(i))
+	}
+
 	for rf.isState(LEADER) && rf.nextIndex[server] <= index {
 		args.PrevLogIndex = rf.nextIndex[server] - 1
-		_, args.PrevLogTerm = rf.readLog(args.PrevLogIndex)
-		args.Entries, args.EntriesT = rf.readLog(rf.nextIndex[server])
+		// _, args.PrevLogTerm = rf.readLog(args.PrevLogIndex)
+		// args.Entries, args.EntriesT = rf.readLog(rf.nextIndex[server])
+		args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
+
+		// 从这接着写
+		// if args.Entries == nil {
+		// 	args.Entries = append(args.Entries, rf.readLog(rf.nextIndex[server]))
+		// } else {
+		// 	args.Entries[0] = rf.readLog(rf.nextIndex[server])
+		// }
+		args.Entries = append(args.Entries, rf.readLog(rf.nextIndex[server]))
+
 		reply := &AppendEntriesReply{}
 
-		// DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getCurrentTerm())
+		DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getCurrentTerm())
 
 		ok := rf.sendAppendEntries(server, args, reply)
 		for !ok && rf.isState(LEADER) {
@@ -429,10 +483,14 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 				return
 			}
 			rf.nextIndex[server]--
-			DPrintf("领导者 %v 减小了追随者 %v 的 nextIndex，当前 nextIndex = %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], rf.getCurrentTerm())
+			DPrintf("领导者 %v 减小了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], rf.getCurrentTerm())
 		} else {
-			rf.matchIndex[server] = rf.nextIndex[server]
-			rf.nextIndex[server]++
+			// rf.matchIndex[server] = rf.nextIndex[server]
+			// rf.nextIndex[server]++
+			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+			rf.nextIndex[server] += len(args.Entries)
+			DPrintf("领导者 %v 增加了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，index = %v, 追加截止条目 %v,当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], index, args.Entries, rf.getCurrentTerm())
+
 		}
 	}
 	if rf.isState(LEADER) && rf.getCurrentTerm() == entryTerm {
@@ -440,13 +498,15 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 	}
 }
 func (rf *Raft) runHeartbeat() {
-	rf.heartbeatTicker = time.NewTicker(rf.electTimeout)
+	// rf.heartbeatTicker = time.NewTicker(rf.electTimeout)
+	rf.newHeartbeatTicker()
 	for rf.isState(LEADER) {
-		<-rf.heartbeatTicker.C
+		// <-rf.heartbeatTicker.C
+		rf.heartbeatTimeout()
 		args := &AppendEntriesArgs{}
 		args.LeaderId = rf.me
 		args.PrevLogIndex = rf.getLogLen() - 1
-		_, args.PrevLogTerm = rf.readLog(args.PrevLogIndex)
+		args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
 		args.LeaderCommit = rf.getCommitIndex() // it must be less than or equal to PrevLogIndex
 		args.Term = rf.getCurrentTerm()
 		for i := 0; i < len(rf.peers); i++ {
@@ -455,7 +515,8 @@ func (rf *Raft) runHeartbeat() {
 			}
 		}
 	}
-	rf.heartbeatTicker.Stop()
+	// rf.heartbeatTicker.Stop()
+	rf.stopHeartbeatTicker()
 }
 
 func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
@@ -463,13 +524,19 @@ func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
 
 	ok := rf.sendAppendEntries(server, args, reply)
-	for !ok && rf.isState(LEADER) {
-		time.Sleep(5 * time.Millisecond)
-		ok = rf.sendAppendEntries(server, args, reply)
-	}
-	if !(ok && rf.isState(LEADER)) {
+	// for !ok && rf.isState(LEADER) {
+	// 	time.Sleep(5 * time.Millisecond)
+	// 	ok = rf.sendAppendEntries(server, args, reply)
+	// }
+	// if !(ok && rf.isState(LEADER)) {
+	// 	return
+	// }
+	if !ok {
 		return
 	}
+
+	DPrintf("领导者 %v 给追随者 %v 的心跳成功，其中 commitIndex 为 %v, 当前任期 %v",
+		rf.me, server, args.LeaderCommit, rf.getCurrentTerm())
 
 	if !reply.Success && reply.Term > rf.getCurrentTerm() {
 		rf.changeState(FOLLOWER)
@@ -480,11 +547,13 @@ func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
 }
 
 func (rf *Raft) electionTimer() {
-	rf.electTicker = time.NewTicker(rf.electTimeout)
+	// rf.electTicker = time.NewTicker(rf.electTimeout)
+	rf.newElectTicker()
 	for {
 		<-rf.electTicker.C
 		if !rf.isState(LEADER) {
-			rf.electTicker.Reset(rf.electTimeout)
+			// rf.electTicker.Reset(rf.electTimeout)
+			rf.resetElectTicker()
 
 			rf.increaseCurrentTerm()
 			rf.changeState(CANDADITE)
@@ -493,7 +562,7 @@ func (rf *Raft) electionTimer() {
 			rvArgs.CandidateId = rf.me
 			rvArgs.Term = rf.getCurrentTerm()
 			rvArgs.LastLogIndex = rf.getLogLen() - 1
-			_, rvArgs.LastLogTerm = rf.readLog(rvArgs.LastLogIndex)
+			rvArgs.LastLogTerm = rf.readLog(rvArgs.LastLogIndex).Term
 
 			rf.setVotesNum(1) // vote for itself
 			rf.setVotedFor(rf.me)
@@ -526,7 +595,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	lastLogIndex := rf.getLogLen() - 1
-	_, lastLogTerm := rf.readLog(lastLogIndex)
+	lastLogTerm := rf.readLog(lastLogIndex).Term
 	if args.LastLogTerm < lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		return
@@ -539,7 +608,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// DPrintf("%v %v\n", args.Term, rf.votedTerm)
 	if rf.getVotedFor() == -1 {
 		// DPrintf("服务器 %v 给服务器 %v 投了一票\n", rf.me, args.CandidateId)
-		rf.electTicker.Reset(rf.electTimeout)
+		// rf.electTicker.Reset(rf.electTimeout)
+		rf.resetElectTicker()
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(args.Term)
 		rf.setVotedFor(args.CandidateId)
@@ -548,14 +618,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
 	currTerm := rf.getCurrentTerm()
 	reply.Term = currTerm
+
+	// if args.Entries != nil {
+	// 	DPrintf("%v", args.Entries)
+	// }
 
 	if args.Term < currTerm {
 		return
 	}
 
-	rf.electTicker.Reset(rf.electTimeout)
+	// rf.electTicker.Reset(rf.electTimeout)
+	rf.resetElectTicker()
 
 	if args.Term > currTerm {
 		rf.setCurrentTerm(args.Term)
@@ -567,7 +643,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	lastLogIndex := rf.getLogLen() - 1
-	_, lastLogTerm := rf.readLog(lastLogIndex)
+	lastLogTerm := rf.readLog(lastLogIndex).Term
 	if lastLogIndex < args.PrevLogIndex ||
 		(lastLogIndex == args.PrevLogIndex && lastLogTerm != args.PrevLogTerm) {
 		return
@@ -576,24 +652,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Entries != nil {
 		if lastLogIndex > args.PrevLogIndex {
 			nextLogIndex := args.PrevLogIndex + 1
-			_, nextLogTerm := rf.readLog(nextLogIndex)
-			if nextLogTerm == args.EntriesT { // the follower already has the next entry to append
+			nextLogTerm := rf.readLog(nextLogIndex).Term
+			if nextLogTerm == args.Entries[0].Term { // the follower already has the next entry to append
 				reply.Success = true
 				return
 			} else { // truncate
 				DPrintf("截断")
 				rf.trimRightLog(nextLogIndex)
 				lastLogIndex = rf.getLogLen() - 1
-				_, lastLogTerm = rf.readLog(lastLogIndex)
+				lastLogTerm = rf.readLog(lastLogIndex).Term
 			}
 		}
 		if lastLogIndex == args.PrevLogIndex &&
 			lastLogTerm == args.PrevLogTerm {
-			rf.appendLog(logEntry{args.Entries, args.EntriesT})
-			DPrintf("追随者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前任期 %v\n",
-				rf.me, rf.getLogLen()-1, args.Entries, rf.getLogLen(), args.Term)
+			for i := len(args.Entries) - 1; i >= 0; i-- {
+				rf.appendLog(args.Entries[i])
+				DPrintf("追随者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前日志 %v, 当前任期 %v\n",
+					rf.me, rf.getLogLen()-1, args.Entries[i], rf.getLogLen(), rf.log, args.Term)
+			}
+			// rf.appendLog(args.Entries[0])
+			// DPrintf("追随者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前任期 %v\n",
+			// 	rf.me, rf.getLogLen()-1, args.Entries, rf.getLogLen(), args.Term)
 			reply.Success = true
-
 		}
 	} else if lastLogIndex == args.PrevLogIndex &&
 		lastLogTerm == args.PrevLogTerm {
@@ -661,23 +741,30 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 
-func (rf *Raft) startAgreement(index int, command interface{}, rc *replicateCount) {
-
+func (rf *Raft) startAgreement(index int, command interface{}) {
+	DPrintf("领导者 %v 开始在索引 %v 的条目 %v 的一致性", rf.me, index, rf.readLog(index).Entry)
+	rf.muAgreement.Lock()
+	defer rf.muAgreement.Unlock()
+	DPrintf("GO 领导者 %v 开始在索引 %v 的条目 %v 的一致性", rf.me, index, rf.readLog(index).Entry)
+	if index <= rf.getCommitIndex() {
+		return
+	}
+	rc := &replicateCount{}
+	rc.addCount()
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go rf.sendReplication(i, index, rc)
 		}
 	}
-
-	for rc.getCount() < len(rf.peers)/2+1 {
+	for rf.isState(LEADER) && rc.getCount() < len(rf.peers)/2+1 {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if index > rf.getCommitIndex() {
+	if rf.isState(LEADER) {
 		rf.setCommitIndex(index)
+		go rf.apply()
 	}
 
-	go rf.apply()
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
@@ -686,11 +773,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := false
 	// Your code here (2B).
 	if rf.isState(LEADER) {
-		rc := replicateCount{}
-		rc.addCount()
+
 		index1 := rf.appendLog(logEntry{command, rf.getCurrentTerm()})
-		DPrintf("领导者 %v 在索引 %v 处追加了 %v，当前任期 %v\n", rf.me, index1, command, rf.getCurrentTerm())
-		go rf.startAgreement(index1, command, &rc)
+		DPrintf("领导者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前日志 %v, 当前任期 %v\n",
+			rf.me, index1, command, rf.getLogLen(), rf.log, rf.getCurrentTerm())
+		go rf.startAgreement(index1, command)
 
 		index = index1
 		term = rf.getCurrentTerm()
