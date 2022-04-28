@@ -57,7 +57,7 @@ const (
 const (
 	ELECT_TIMEOUT_LEFT = 150 // unit: ms
 	ELECT_TIMEOUT_SPAN = 150
-	HEARTBEAT_INTERVAL = 80
+	HEARTBEAT_INTERVAL = 100
 )
 
 func Min(a, b int) int {
@@ -227,7 +227,6 @@ func (rf *Raft) getCommitIndex() int {
 func (rf *Raft) setCommitIndex(a int) {
 	rf.muCommitIndex.Lock()
 	defer rf.muCommitIndex.Unlock()
-	// DPrintf("服务器 %v commitIndex 由 %v 修改为 %v", rf.me, rf.commitIndex, a)
 	rf.commitIndex = a
 }
 
@@ -412,18 +411,19 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) startRequestVote(server int, args *RequestVoteArgs) {
 	reply := &RequestVoteReply{}
 
-	// ok := rf.sendRequestVote(server, args, reply)
-	// for i := 0; !ok && rf.isState(CANDADITE) && i < 5; i++ {
-	// 	time.Sleep(5 * time.Millisecond)
-	// 	ok = rf.sendRequestVote(server, args, reply)
-	// }
-	// if !(ok && rf.isState(CANDADITE)) {
-	// 	return
-	// }
-
-	if ok := rf.sendRequestVote(server, args, reply); !ok {
+	currT := rf.getCurrentTerm()
+	ok := rf.sendRequestVote(server, args, reply)
+	for !ok && rf.isState(CANDADITE) && rf.getCurrentTerm() == currT {
+		time.Sleep(10 * time.Millisecond)
+		ok = rf.sendRequestVote(server, args, reply)
+	}
+	if !ok || !rf.isState(CANDADITE) || rf.getCurrentTerm() != currT {
 		return
 	}
+
+	// if ok := rf.sendRequestVote(server, args, reply); !ok {
+	// 	return
+	// }
 
 	if reply.Term > rf.getCurrentTerm() {
 		rf.changeState(FOLLOWER)
@@ -456,6 +456,13 @@ func (rf *Raft) electionTimer() {
 	rf.newElectTicker()
 	for {
 		<-rf.electTicker.C
+
+		// TODO: I don't understand here
+		// 		 and receive AppendEnrties RPC func(),
+		//       i.e. heartbeat and append
+		// if rf.isState(LEADER) {
+		// 	continue
+		// }
 		rf.resetElectTicker()
 
 		rf.increaseCurrentTerm()
@@ -503,12 +510,14 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 		reply := &AppendEntriesReply{}
 
 		// DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getCurrentTerm())
+
+		currT := rf.getCurrentTerm()
 		ok := rf.sendAppendEntries(server, args, reply)
-		for !ok && rf.isState(LEADER) {
-			time.Sleep(5 * time.Millisecond)
+		for !ok && rf.isState(LEADER) && rf.getCurrentTerm() == currT {
+			time.Sleep(10 * time.Millisecond)
 			ok = rf.sendAppendEntries(server, args, reply)
 		}
-		if !(ok && rf.isState(LEADER)) {
+		if !ok || !rf.isState(LEADER) || rf.getCurrentTerm() != currT {
 			return
 		}
 
@@ -522,6 +531,7 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 			rf.decreaseNextIndex(server)
 			// DPrintf("领导者 %v 减小了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], rf.getCurrentTerm())
 		} else {
+			rf.resetElectTicker()
 			rf.setMatchIndex(server, args.PrevLogIndex+len(args.Entries))
 			rf.addNextIndex(server, len(args.Entries))
 			// DPrintf("领导者 %v 增加了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，index = %v, 追加截止条目 %v,当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], index, args.Entries, rf.getCurrentTerm())
@@ -553,18 +563,32 @@ func (rf *Raft) runHeartbeat() {
 
 func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
 	reply := &AppendEntriesReply{}
-	if ok := rf.sendAppendEntries(server, args, reply); !ok {
+
+	currT := rf.getCurrentTerm()
+	ok := rf.sendAppendEntries(server, args, reply)
+	for !ok && rf.isState(LEADER) && rf.getCurrentTerm() == currT {
+		time.Sleep(10 * time.Millisecond)
+		ok = rf.sendAppendEntries(server, args, reply)
+	}
+	if !ok || !rf.isState(LEADER) || rf.getCurrentTerm() != currT {
 		return
 	}
-	// DPrintf("领导者 %v 给追随者 %v 的心跳成功，其中 commitIndex 为 %v, 当前任期 %v",
-	// rf.me, server, args.LeaderCommit, rf.getCurrentTerm())
 
-	if !reply.Success && reply.Term > rf.getCurrentTerm() {
+	if reply.Success {
+		rf.resetElectTicker()
+	} else if reply.Term > rf.getCurrentTerm() {
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(reply.Term)
 		rf.setVotedFor(-1)
 		return
 	}
+
+	// if !reply.Success && reply.Term > rf.getCurrentTerm() {
+	// 	rf.changeState(FOLLOWER)
+	// 	rf.setCurrentTerm(reply.Term)
+	// 	rf.setVotedFor(-1)
+	// 	return
+	// }
 }
 
 //
@@ -591,14 +615,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// DPrintf("候选人 %v 请求服务器 %v 投票，任期 %v，服务器总数 %v\n", args.CandidateId, rf.me, args.Term, len(rf.peers))
 	rf.muGrantVote.Lock()
 	defer rf.muGrantVote.Unlock()
-	// DPrintf("候选人 %v 请求服务器 %v 投票，%v %v\n", args.CandidateId, rf.me, rf.votedTerm, args.Term)
-	// DPrintf("%v %v\n", args.Term, rf.votedTerm)
 	if rf.getVotedFor() == -1 {
-		// DPrintf("服务器 %v 给服务器 %v 投了一票\n", rf.me, args.CandidateId)
-		// rf.electTicker.Reset(rf.electTimeout)
 		rf.resetElectTicker()
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(args.Term)
@@ -720,7 +739,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 //
 
 func (rf *Raft) startAgreement(index int, command interface{}) {
-	// DPrintf("领导者 %v 开始在索引 %v 的条目 %v 的一致性", rf.me, index, rf.readLog(index).Command)
 	rf.muAgreement.Lock()
 	defer rf.muAgreement.Unlock()
 	// DPrintf("GO 领导者 %v 开始在索引 %v 的条目 %v 的一致性", rf.me, index, rf.readLog(index).Command)
