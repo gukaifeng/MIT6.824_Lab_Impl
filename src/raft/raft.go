@@ -355,8 +355,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // return currentTerm and whether this server
@@ -498,15 +500,24 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 	args.Term = rf.getCurrentTerm()
 	args.LeaderCommit = rf.getCommitIndex()
 
+	lastIndex := index
 	ni := rf.getNextIndex(server)
-	for i := index; i > ni; i-- {
-		args.Entries = append(args.Entries, rf.readLog(i))
+	// for i := index; i > ni; i-- {
+	// 	args.Entries = append(args.Entries, rf.readLog(i))
+	// }
+	for ; lastIndex > ni; lastIndex-- {
+		args.Entries = append(args.Entries, rf.readLog(lastIndex))
 	}
 
 	for ; rf.isState(LEADER) && ni <= index; ni = rf.getNextIndex(server) {
 		args.PrevLogIndex = ni - 1
 		args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
-		args.Entries = append(args.Entries, rf.readLog(ni))
+		// args.Entries = append(args.Entries, rf.readLog(ni))
+
+		for ; lastIndex >= ni; lastIndex-- {
+			args.Entries = append(args.Entries, rf.readLog(lastIndex))
+		}
+
 		reply := &AppendEntriesReply{}
 
 		// DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getCurrentTerm())
@@ -528,7 +539,22 @@ func (rf *Raft) sendReplication(server int, index int, rc *replicateCount) {
 				rf.setVotedFor(-1)
 				return
 			}
-			rf.decreaseNextIndex(server)
+			// conflict response
+			found := false
+			if reply.ConflictTerm != -1 {
+				for i := ni; i >= 0; i-- {
+					if t := rf.readLog(i).Term; t == reply.ConflictTerm {
+						rf.setNextIndex(server, i+1)
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				rf.setNextIndex(server, reply.ConflictIndex)
+			}
+
+			// rf.decreaseNextIndex(server)
 			// DPrintf("领导者 %v 减小了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], rf.getCurrentTerm())
 		} else {
 			rf.resetElectTicker()
@@ -646,9 +672,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	lastLogIndex := rf.getLogLen() - 1
 	lastLogTerm := rf.readLog(lastLogIndex).Term
-	if lastLogIndex < args.PrevLogIndex ||
-		(lastLogIndex == args.PrevLogIndex && lastLogTerm != args.PrevLogTerm) {
+	// if lastLogIndex < args.PrevLogIndex ||
+	// 	lastLogTerm != args.PrevLogTerm {
+	// 	return
+	// }
+	if lastLogIndex < args.PrevLogIndex {
+		reply.ConflictIndex = lastLogIndex + 1
+		reply.ConflictTerm = -1
 		return
+	} else {
+		t := rf.readLog(args.PrevLogIndex).Term
+		if t != args.PrevLogTerm {
+			// reply.ConflictIndex = -1
+			reply.ConflictTerm = t
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if rf.readLog(i).Term != t {
+					reply.ConflictIndex = i + 1
+					break
+				}
+			}
+			return
+		}
 	}
 
 	if args.Entries != nil {
