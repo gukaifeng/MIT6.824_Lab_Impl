@@ -112,13 +112,14 @@ type Raft struct {
 	log   []Entry
 	muLog sync.Mutex // mutex for append and start agreememt in the leader
 
+	muAppendEntries sync.Mutex
+
 	// commit
 	commitIndex   int
 	muCommitIndex sync.Mutex
 
 	// apply
 	lastApplied int
-	muApply     sync.Mutex
 	applyCh     chan ApplyMsg
 
 	// the leader maintains for the followers
@@ -239,9 +240,10 @@ func (rf *Raft) setCommitIndex(a int) {
 
 // apply
 func (rf *Raft) apply() {
-	rf.muApply.Lock()
-	defer rf.muApply.Unlock()
-	for ; rf.lastApplied < rf.getCommitIndex(); rf.lastApplied++ {
+	rf.muAppendEntries.Lock()
+	defer rf.muAppendEntries.Unlock()
+	commitIndex := rf.getCommitIndex()
+	for ; rf.lastApplied < commitIndex; rf.lastApplied++ {
 		c := rf.readLog(rf.lastApplied + 1).Command
 		rf.applyCh <- ApplyMsg{true, c, rf.lastApplied + 1}
 		// if rf.isState(LEADER) {
@@ -368,6 +370,18 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludeTerm   int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -398,11 +412,19 @@ func (rf *Raft) persist() {
 
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	// e.Encode(rf.lastApplied)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastApplied)
 	e.Encode(rf.log)
+
+	// l := rf.getLogLen()
+	// for i := 0; i < l; i++ {
+	// 	e.Encode(rf.readLog(i))
+	// }
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+
+	// fmt.Printf("服务器 %v 保存持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
 }
 
 //
@@ -430,19 +452,23 @@ func (rf *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var votedFor int
-	// var lastApplied int
+	var commitIndex int
+	var lastApplied int
 	var log []Entry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		// d.Decode(&lastApplied) != nil ||
+		d.Decode(&commitIndex) != nil ||
+		d.Decode(&lastApplied) != nil ||
 		d.Decode(&log) != nil {
 		return
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		// rf.lastApplied = lastApplied
+		rf.commitIndex = commitIndex
+		rf.lastApplied = lastApplied
 		rf.log = log
 	}
+	// fmt.Printf("服务器 %v 恢复持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
 }
 
 func (rf *Raft) startRequestVote(server int, args *RequestVoteArgs) {
@@ -695,6 +721,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // AppendEntries RPC handler.
 //
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.muAppendEntries.Lock()
+	defer rf.muAppendEntries.Unlock()
+
 	currTerm := rf.getCurrentTerm()
 	reply.Term = currTerm
 	if args.Term < currTerm {
@@ -711,10 +740,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	lastLogIndex := rf.getLogLen() - 1
 	var lastLogTerm int
-	// if lastLogIndex < args.PrevLogIndex ||
-	// 	lastLogTerm != args.PrevLogTerm {
-	// 	return
-	// }
 	if lastLogIndex < args.PrevLogIndex {
 		reply.ConflictIndex = lastLogIndex + 1
 		reply.ConflictTerm = -1
@@ -723,7 +748,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		lastLogTerm = rf.readLog(lastLogIndex).Term
 		t := rf.readLog(args.PrevLogIndex).Term
 		if t != args.PrevLogTerm {
-			// reply.ConflictIndex = -1
 			reply.ConflictTerm = t
 			for i := args.PrevLogIndex; i >= 0; i-- {
 				if rf.readLog(i).Term != t {
@@ -736,34 +760,35 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if args.Entries != nil {
+		nextIndex := len(args.Entries) - 1
 		if lastLogIndex > args.PrevLogIndex {
-			nextLogIndex := args.PrevLogIndex + 1
-			nextLogTerm := rf.readLog(nextLogIndex).Term
-			if nextLogTerm == args.Entries[0].Term { // the follower already has the next entry to append
-				reply.Success = true
-				return
-			} else { // truncate
-				rf.trimRightLog(nextLogIndex)
-				lastLogIndex = rf.getLogLen() - 1
-				lastLogTerm = rf.readLog(lastLogIndex).Term
+			for j := 1; nextIndex >= 0; nextIndex-- {
+				nextLogIndex := args.PrevLogIndex + j
+				if nextLogIndex > len(rf.log)-1 {
+					break
+				}
+				nextLogTerm := rf.readLog(nextLogIndex).Term
+				if nextLogTerm != args.Entries[nextIndex].Term {
+					rf.trimRightLog(nextLogIndex)
+					break
+				}
+				j++
 			}
 		}
-		if lastLogIndex == args.PrevLogIndex &&
-			lastLogTerm == args.PrevLogTerm {
-			for i := len(args.Entries) - 1; i >= 0; i-- {
-				rf.appendLog(args.Entries[i])
-				// DPrintf("追随者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前日志 %v, 当前任期 %v\n",
-				// 	rf.me, rf.getLogLen()-1, args.Entries[i], rf.getLogLen(), rf.log, args.Term)
-			}
-			reply.Success = true
+		for ; nextIndex >= 0; nextIndex-- {
+			rf.appendLog(args.Entries[nextIndex])
 		}
+		reply.Success = true
 	} else if lastLogIndex == args.PrevLogIndex &&
 		lastLogTerm == args.PrevLogTerm {
 		reply.Success = true
 	}
 
 	if reply.Success {
-		rf.setCommitIndex(Min(args.LeaderCommit, rf.getLogLen()-1))
+		minCommitIndex := Min(args.LeaderCommit, rf.getLogLen()-1)
+		if minCommitIndex > rf.getCommitIndex() {
+			rf.setCommitIndex(minCommitIndex)
+		}
 	}
 	go rf.apply()
 }
