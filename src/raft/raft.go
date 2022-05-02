@@ -57,9 +57,9 @@ const (
 )
 
 const (
-	ELECT_TIMEOUT_LEFT = 150 // unit: ms
-	ELECT_TIMEOUT_SPAN = 150
-	HEARTBEAT_INTERVAL = 100
+	ELECT_TIMEOUT_LEFT = 200 // unit: ms
+	ELECT_TIMEOUT_SPAN = 100
+	HEARTBEAT_INTERVAL = 50
 )
 
 func Min(a, b int) int {
