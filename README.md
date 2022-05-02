@@ -20,7 +20,7 @@
 ```
 
 除了上面的这些外，你可能还会看到很多下面这样的输出，忽略就好。
-```shell
+```
 2022/05/02 19:22:05 rpc.Register: method "Done" has 1 input parameters; needs exactly three
 ```
 
@@ -28,50 +28,50 @@
 
 ## Lab2
 
-```shell
+```
 [gukaifeng@iZ8vbf7xcuoq7ug1e7hjk5Z raft]$ time go test
 Test (2A): initial election ...
-  ... Passed --   3.0  3   56   15274    0
+  ... Passed --   3.1  3  110   30232    0
 Test (2A): election after network failure ...
-  ... Passed --   4.5  3  118   18516    0
+  ... Passed --   4.5  3  128   24809    0
 Test (2B): basic agreement ...
-  ... Passed --   0.5  3   14    3766    3
+  ... Passed --   0.6  3   14    3794    3
 Test (2B): RPC byte count ...
-  ... Passed --   1.3  3   46  113154   11
+  ... Passed --   0.9  3   46  113246   11
 Test (2B): agreement despite follower disconnection ...
-  ... Passed --   5.6  3  149   36218    8
+  ... Passed --   5.4  3  209   55562    8
 Test (2B): no agreement if too many followers disconnect ...
-  ... Passed --   3.5  5  269   48910    4
+  ... Passed --   3.5  5  350   77663    3
 Test (2B): concurrent Start()s ...
-  ... Passed --   0.5  3   20    5532    6
+  ... Passed --   0.6  3   24    6818    6
 Test (2B): rejoin of partitioned leader ...
-  ... Passed --   2.1  3   70   14693    4
+  ... Passed --   2.3  3   99   22613    4
 Test (2B): leader backs up quickly over incorrect follower logs ...
-  ... Passed --  22.5  5 2669  500322  102
+  ... Passed --  12.8  5 1334  632664  102
 Test (2B): RPC counts aren't too high ...
-  ... Passed --   2.2  3   52   14758   12
+  ... Passed --   2.1  3   98   27906   12
 Test (2C): basic persistence ...
-  ... Passed --   3.6  3  100   22990    6
+  ... Passed --   3.5  3  128   30655    6
 Test (2C): more persistence ...
-  ... Passed --  13.3  5  992  168247   17
+  ... Passed --  11.0  5  798  153220   16
 Test (2C): partitioned leader and one follower crash, leader restarts ...
-  ... Passed --   1.4  3   41    9578    4
+  ... Passed --   1.6  3   47   11317    4
 Test (2C): Figure 8 ...
-  ... Passed --  35.8  5 2085  397433   83
+  ... Passed --  29.1  5 1482  294102   53
 Test (2C): unreliable agreement ...
-  ... Passed --   5.2  5  738  228682  252
+  ... Passed --   3.0  5  708  346841  246
 Test (2C): Figure 8 (unreliable) ...
-  ... Passed --  32.3  5 2716  350697   29
+  ... Passed --  31.5  5 1750  440162   73
 Test (2C): churn ...
-  ... Passed --  16.3  5 1206  346655  316
+  ... Passed --  16.2  5 1452 1261721  662
 Test (2C): unreliable churn ...
-  ... Passed --  16.3  5 1344  377140  217
+  ... Passed --  16.1  5 1965  891346  533
 PASS
-ok  	_/home/gukaifeng/projects/6.824/src/raft	169.711s
+ok  	_/home/gukaifeng/projects/6.824/src/raft	147.686s
 
-real	2m49.930s
-user	0m3.908s
-sys	0m0.936s
+real	2m27.916s
+user	0m4.425s
+sys	0m0.900s
 ```
 
 ## Lab3
