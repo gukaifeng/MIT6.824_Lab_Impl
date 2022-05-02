@@ -4,7 +4,7 @@
 
 ## Lab1
 
-```shell
+```
 [gukaifeng@iZ8vbf7xcuoq7ug1e7hjk5Z main]$ sh ./test-mr.sh
 *** Starting wc test.
 --- wc test: PASS
