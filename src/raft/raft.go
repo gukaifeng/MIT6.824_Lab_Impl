@@ -389,8 +389,8 @@ func (rf *Raft) persist() {
 
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
+	// e.Encode(rf.commitIndex)
+	// e.Encode(rf.lastApplied)
 	e.Encode(rf.log)
 
 	// l := rf.getLogLen()
@@ -401,7 +401,7 @@ func (rf *Raft) persist() {
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 
-	// fmt.Printf("服务器 %v 保存持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
+	// DPrintf("服务器 %v 保存持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
 }
 
 //
@@ -429,23 +429,23 @@ func (rf *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var votedFor int
-	var commitIndex int
-	var lastApplied int
+	// var commitIndex int
+	// var lastApplied int
 	var log []Entry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&commitIndex) != nil ||
-		d.Decode(&lastApplied) != nil ||
+		// d.Decode(&commitIndex) != nil ||
+		// d.Decode(&lastApplied) != nil ||
 		d.Decode(&log) != nil {
 		return
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
-		rf.commitIndex = commitIndex
-		rf.lastApplied = lastApplied
+		// rf.commitIndex = commitIndex
+		// rf.lastApplied = lastApplied
 		rf.log = log
 	}
-	// fmt.Printf("服务器 %v 恢复持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
+	DPrintf("服务器 %v 恢复持久化的日志长度为 %v\n", rf.me, rf.getLogLen())
 }
 
 func (rf *Raft) startRequestVote(server int, args *RequestVoteArgs) {
@@ -532,9 +532,15 @@ func (rf *Raft) electionTimer() {
 	}
 }
 
-func (rf *Raft) sendReplication(server int, index int) {
+func (rf *Raft) sendReplication(server int, index int, wg *sync.WaitGroup) {
 	// DPrintf("领导者 %v 开始追随者 %v 在索引 %v 的条目 %v 的一致性", rf.me, server, index, rf.readLog(index).Command)
+	if wg != nil {
+		defer wg.Done()
+	}
+
 	if !rf.isState(LEADER) || index > rf.getLogLen()-1 {
+		DPrintf("领导者 %v 发送给追随者 %v 在索引 %v 的条目异常退出 NO 1",
+			rf.me, server, index)
 		return
 	}
 	// entryTerm := rf.readLog(index).Term
@@ -553,6 +559,7 @@ func (rf *Raft) sendReplication(server int, index int) {
 		args.Entries = append(args.Entries, rf.readLog(lastIndex))
 	}
 
+	DPrintf("领导者 %v 准备给追随者 %v 发送终点索引为 %v 处的条目 %v，ni = %v, 当前任期 %v\n", rf.me, server, index, args.Entries, ni, rf.getCurrentTerm())
 	for ; rf.isState(LEADER) && ni <= index; ni = rf.getNextIndex(server) {
 		args.PrevLogIndex = ni - 1
 		args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
@@ -564,7 +571,7 @@ func (rf *Raft) sendReplication(server int, index int) {
 
 		reply := &AppendEntriesReply{}
 
-		// DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, rf.nextIndex[server], args.Entries, rf.getCurrentTerm())
+		DPrintf("领导者 %v 正在给追随者 %v 发送索引 %v 处的条目 %v，当前任期 %v\n", rf.me, server, ni, args.Entries, rf.getCurrentTerm())
 
 		currT := rf.getCurrentTerm()
 		ok := rf.sendAppendEntries(server, args, reply)
@@ -573,10 +580,14 @@ func (rf *Raft) sendReplication(server int, index int) {
 			ok = rf.sendAppendEntries(server, args, reply)
 		}
 		if !ok || !rf.isState(LEADER) || rf.getCurrentTerm() != currT {
+			DPrintf("领导者 %v 发送给追随者 %v 在索引 %v 的条目异常退出 NO 2, ok = %v, isLeader = %v, rf.getCurrentTerm = %v, currt = %v",
+				rf.me, server, index, ok, rf.isState(LEADER), rf.getCurrentTerm(), currT)
 			return
 		}
 
 		if rf.getCurrentTerm() != args.Term { // outdated rpc reply
+			DPrintf("领导者 %v 发送给追随者 %v 在索引 %v 的条目异常退出 NO 3",
+				rf.me, server, index)
 			return
 		}
 
@@ -585,6 +596,8 @@ func (rf *Raft) sendReplication(server int, index int) {
 				rf.changeState(FOLLOWER)
 				rf.setCurrentTerm(reply.Term)
 				rf.setVotedFor(-1)
+				DPrintf("领导者 %v 发送给追随者 %v 在索引 %v 的条目异常退出 NO 4",
+					rf.me, server, index)
 				return
 			}
 			// conflict response
@@ -592,6 +605,7 @@ func (rf *Raft) sendReplication(server int, index int) {
 			if reply.ConflictTerm != -1 {
 				for i := ni; i >= 0; i-- {
 					if t := rf.readLog(i).Term; t == reply.ConflictTerm {
+						DPrintf("冲突1，领导者 %v 在追随者 %v 的 nextIndex 修改为 %v", rf.me, server, reply.ConflictIndex)
 						rf.setNextIndex(server, i+1)
 						found = true
 						break
@@ -599,6 +613,7 @@ func (rf *Raft) sendReplication(server int, index int) {
 				}
 			}
 			if !found {
+				DPrintf("冲突2，领导者 %v 在追随者 %v 的 nextIndex 修改为 %v", rf.me, server, reply.ConflictIndex)
 				rf.setNextIndex(server, reply.ConflictIndex)
 			}
 
@@ -609,7 +624,7 @@ func (rf *Raft) sendReplication(server int, index int) {
 			rf.setMatchIndex(server, args.PrevLogIndex+len(args.Entries))
 			// DPrintf("领导者 %v 设置追随者 %v 的 matchIndex 为 %v", rf.me, server, args.PrevLogIndex+len(args.Entries))
 			rf.addNextIndex(server, len(args.Entries))
-			// DPrintf("领导者 %v 增加了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，index = %v, 追加截止条目 %v,当前任期 %v\n", rf.me, server, server, rf.nextIndex[server], index, args.Entries, rf.getCurrentTerm())
+			DPrintf("领导者 %v 增加了追随者 %v 的 nextIndex[%v]，当前 nextIndex = %v，index = %v, 追加截止条目 %v,当前任期 %v\n", rf.me, server, server, rf.getNextIndex(server), index, args.Entries, rf.getCurrentTerm())
 
 		}
 	}
@@ -618,6 +633,7 @@ func (rf *Raft) runHeartbeat() {
 	rf.newHeartbeatTicker()
 	for rf.isState(LEADER) && !rf.killed() {
 		rf.heartbeatTimeout()
+		DPrintf("领导者 %v 发起了一轮心跳", rf.me)
 		args := &AppendEntriesArgs{}
 		args.LeaderId = rf.me
 		args.PrevLogIndex = rf.getLogLen() - 1
@@ -660,7 +676,25 @@ func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs) {
 		rf.setVotedFor(-1)
 	} else {
 		// try to make the follower's log the same as the leader's log
-		rf.sendReplication(server, rf.getLogLen()-1)
+		DPrintf("领导者 %v 给追随者 %v 在索引 %v 处开始重传，当前任期 %v",
+			rf.me, server, rf.getLogLen()-1, rf.getCurrentTerm())
+		// conflict response
+		found := false
+		if reply.ConflictTerm != -1 {
+			for i := args.PrevLogIndex; i >= 0; i-- {
+				if t := rf.readLog(i).Term; t == reply.ConflictTerm {
+					DPrintf("冲突1，领导者 %v 在追随者 %v 的 nextIndex 修改为 %v", rf.me, server, reply.ConflictIndex)
+					rf.setNextIndex(server, i+1)
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			DPrintf("冲突2，领导者 %v 在追随者 %v 的 nextIndex 修改为 %v", rf.me, server, reply.ConflictIndex)
+			rf.setNextIndex(server, reply.ConflictIndex)
+		}
+		rf.sendReplication(server, rf.getLogLen()-1, nil)
 	}
 
 	// if !reply.Success && reply.Term > rf.getCurrentTerm() {
@@ -863,7 +897,7 @@ func (rf *Raft) checkMatchIndex() {
 				break
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -879,11 +913,12 @@ func (rf *Raft) startAgreement(index int, command interface{}) {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			wg.Add(1)
-			go rf.sendReplication(i, index)
+			go rf.sendReplication(i, index, &wg)
 		}
 	}
 	wg.Wait()
-
+	DPrintf("领导者 %v 在索引 %v 处的条目 %v 的一致性完成",
+		rf.me, index, command)
 	// if rf.isState(LEADER) && !rf.killed() {
 	// 	rf.setCommitIndex(index)
 	// 	go rf.apply()
