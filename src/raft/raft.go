@@ -157,13 +157,11 @@ func (rf *Raft) increaseCurrentTerm() {
 	rf.muCurrentTerm.Lock()
 	defer rf.muCurrentTerm.Unlock()
 	rf.currentTerm++
-	rf.persist()
 }
 func (rf *Raft) setCurrentTerm(a int) {
 	rf.muCurrentTerm.Lock()
 	defer rf.muCurrentTerm.Unlock()
 	rf.currentTerm = a
-	rf.persist()
 }
 func (rf *Raft) getCurrentTerm() int {
 	rf.muCurrentTerm.Lock()
@@ -176,7 +174,6 @@ func (rf *Raft) setVotedFor(a int) {
 	rf.muVotedFor.Lock()
 	defer rf.muVotedFor.Unlock()
 	rf.votedFor = a
-	rf.persist()
 }
 func (rf *Raft) getVotedFor() int {
 	rf.muVotedFor.Lock()
@@ -206,7 +203,6 @@ func (rf *Raft) appendLog(e Entry) int {
 	rf.muLog.Lock()
 	defer rf.muLog.Unlock()
 	rf.log = append(rf.log, e)
-	rf.persist()
 	return len(rf.log) - 1
 }
 func (rf *Raft) readLog(i int) Entry {
@@ -223,7 +219,16 @@ func (rf *Raft) trimRightLog(end int) {
 	rf.muLog.Lock()
 	defer rf.muLog.Unlock()
 	rf.log = rf.log[:end]
-	rf.persist()
+}
+func (rf *Raft) setLog(l []Entry) {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	rf.log = l
+}
+func (rf *Raft) getLog() []Entry {
+	rf.muLog.Lock()
+	defer rf.muLog.Unlock()
+	return rf.log
 }
 
 // commit
@@ -275,6 +280,11 @@ func (rf *Raft) setMatchIndex(i, a int) {
 	rf.muMatchIndex[i].Lock()
 	defer rf.muMatchIndex[i].Unlock()
 	rf.matchIndex[i] = a
+}
+func (rf *Raft) getMatchIndex(i int) int {
+	rf.muMatchIndex[i].Lock()
+	defer rf.muMatchIndex[i].Unlock()
+	return rf.matchIndex[i]
 }
 
 // election timer
@@ -388,9 +398,9 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
+	e.Encode(rf.getCurrentTerm())
+	e.Encode(rf.getVotedFor())
+	e.Encode(rf.getLog())
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -428,9 +438,9 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&log) != nil {
 		return
 	} else {
-		rf.currentTerm = currentTerm
-		rf.votedFor = votedFor
-		rf.log = log
+		rf.setCurrentTerm(currentTerm)
+		rf.setVotedFor(votedFor)
+		rf.setLog(log)
 	}
 }
 
@@ -449,6 +459,7 @@ func (rf *Raft) execRequestVote(server int, args *RequestVoteArgs) {
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(reply.Term)
 		rf.setVotedFor(-1)
+		rf.persist()
 		return
 	}
 
@@ -486,8 +497,9 @@ func (rf *Raft) electionTimer() {
 		// }
 		rf.resetElectTicker()
 
-		rf.increaseCurrentTerm()
 		rf.changeState(CANDADITE)
+		rf.increaseCurrentTerm()
+		rf.persist()
 
 		rvArgs := RequestVoteArgs{}
 		rvArgs.CandidateId = rf.me
@@ -497,6 +509,7 @@ func (rf *Raft) electionTimer() {
 
 		rf.setVotesNum(1) // vote for itself
 		rf.setVotedFor(rf.me)
+		rf.persist()
 
 		// DPrintf("候选者 %v 发起了任期 %v 的选举，当前 %v，当前服务器数 %v\n", rf.me, rf.getCurrentTerm(), rf.isState(LEADER), len(rf.peers))
 		for i := 0; i < len(rf.peers) && rf.isState(CANDADITE); i++ {
@@ -556,6 +569,7 @@ func (rf *Raft) execAppendEntries(server int, index int, wg *sync.WaitGroup) {
 				rf.changeState(FOLLOWER)
 				rf.setCurrentTerm(reply.Term)
 				rf.setVotedFor(-1)
+				rf.persist()
 				return
 			}
 			// conflict response
@@ -610,6 +624,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(args.Term)
 		rf.setVotedFor(-1)
+		rf.persist()
 	}
 
 	lastLogIndex := rf.getLogLen() - 1
@@ -626,6 +641,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.changeState(FOLLOWER)
 		rf.setCurrentTerm(args.Term)
 		rf.setVotedFor(args.CandidateId)
+		rf.persist()
 		reply.VoteGranted = true
 	}
 }
@@ -645,10 +661,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.resetElectTicker()
 	if args.Term > currTerm {
 		rf.setCurrentTerm(args.Term)
+		rf.persist()
 	}
 	if !rf.isState(FOLLOWER) {
 		rf.changeState(FOLLOWER)
 		rf.setVotedFor(args.LeaderId)
+		rf.persist()
 	}
 
 	lastLogIndex := rf.getLogLen() - 1
@@ -683,6 +701,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				nextLogTerm := rf.readLog(nextLogIndex).Term
 				if nextLogTerm != args.Entries[nextIndex].Term {
 					rf.trimRightLog(nextLogIndex)
+					rf.persist()
 					break
 				}
 				j++
@@ -693,6 +712,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for ; nextIndex >= 0; nextIndex-- {
 			rf.appendLog(args.Entries[nextIndex])
 		}
+		rf.persist()
 		reply.Success = true
 	} else if lastLogIndex == args.PrevLogIndex &&
 		lastLogTerm == args.PrevLogTerm {
@@ -774,7 +794,7 @@ func (rf *Raft) checkMatchIndex() {
 			}
 			count := 1
 			for p := 0; p < nServer; p++ {
-				if rf.matchIndex[p] >= n {
+				if rf.getMatchIndex(p) >= n {
 					count++
 					if count >= majorities {
 						rf.setCommitIndex(n)
@@ -815,6 +835,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if rf.isState(LEADER) {
 		index1 := rf.appendLog(Entry{command, rf.getCurrentTerm()})
+		rf.persist()
 		// DPrintf("领导者 %v 在索引 %v 处追加了 %v，当前日志长度 %v，当前日志 %v, 当前任期 %v\n",
 		// 	rf.me, index1, command, rf.getLogLen(), rf.log, rf.getCurrentTerm())
 		go rf.startAgreement(index1, command)
