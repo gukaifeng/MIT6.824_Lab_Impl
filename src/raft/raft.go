@@ -120,6 +120,7 @@ type Raft struct {
 
 	// apply
 	lastApplied int
+	muApply     sync.Mutex
 	applyCh     chan ApplyMsg
 
 	// the leader maintains for the followers
@@ -245,8 +246,8 @@ func (rf *Raft) setCommitIndex(a int) {
 
 // apply
 func (rf *Raft) apply() {
-	rf.muAppendEntries.Lock()
-	defer rf.muAppendEntries.Unlock()
+	rf.muApply.Lock()
+	defer rf.muApply.Unlock()
 	commitIndex := rf.getCommitIndex()
 	for ; rf.lastApplied < commitIndex; rf.lastApplied++ {
 		c := rf.readLog(rf.lastApplied + 1).Command
