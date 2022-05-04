@@ -206,7 +206,7 @@ func (rf *Raft) appendLog(e Entry) int {
 	rf.log = append(rf.log, e)
 	return len(rf.log) - 1
 }
-func (rf *Raft) readLog(i int) Entry {
+func (rf *Raft) ReadLog(i int) Entry {
 	rf.muLog.Lock()
 	defer rf.muLog.Unlock()
 	return rf.log[i]
@@ -250,10 +250,15 @@ func (rf *Raft) apply() {
 	defer rf.muApply.Unlock()
 	commitIndex := rf.getCommitIndex()
 	for ; rf.lastApplied < commitIndex; rf.lastApplied++ {
-		c := rf.readLog(rf.lastApplied + 1).Command
+		c := rf.ReadLog(rf.lastApplied + 1).Command
 		rf.applyCh <- ApplyMsg{true, c, rf.lastApplied + 1}
 		// DPrintf("服务器 %v（%v 领导者） 应用了索引 %v 处的 %v，当前日志长度 %v，当前 commitIndex 为 %v，当前任期 %v\n", rf.me, rf.isState(LEADER), rf.lastApplied+1, c, rf.getLogLen(), rf.getCommitIndex(), rf.getCurrentTerm())
 	}
+}
+func (rf *Raft) GetLastApplied() int {
+	rf.muApply.Lock()
+	defer rf.muApply.Unlock()
+	return rf.lastApplied
 }
 
 // the leader maintains
@@ -506,7 +511,7 @@ func (rf *Raft) electionTimer() {
 		rvArgs.CandidateId = rf.me
 		rvArgs.Term = rf.getCurrentTerm()
 		rvArgs.LastLogIndex = rf.getLogLen() - 1
-		rvArgs.LastLogTerm = rf.readLog(rvArgs.LastLogIndex).Term
+		rvArgs.LastLogTerm = rf.ReadLog(rvArgs.LastLogIndex).Term
 
 		rf.setVotesNum(1) // vote for itself
 		rf.setVotedFor(rf.me)
@@ -539,20 +544,20 @@ func (rf *Raft) execAppendEntries(server int, index int, wg *sync.WaitGroup) {
 	ni := rf.getNextIndex(server)
 
 	for ; lastIndex > ni; lastIndex-- {
-		args.Entries = append(args.Entries, rf.readLog(lastIndex))
+		args.Entries = append(args.Entries, rf.ReadLog(lastIndex))
 	}
 
 	for ; rf.isState(LEADER); ni = rf.getNextIndex(server) {
 		if ni <= index {
 			args.PrevLogIndex = ni - 1
-			args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
+			args.PrevLogTerm = rf.ReadLog(args.PrevLogIndex).Term
 
 			for ; lastIndex >= ni; lastIndex-- {
-				args.Entries = append(args.Entries, rf.readLog(lastIndex))
+				args.Entries = append(args.Entries, rf.ReadLog(lastIndex))
 			}
 		} else {
 			args.PrevLogIndex = index
-			args.PrevLogTerm = rf.readLog(args.PrevLogIndex).Term
+			args.PrevLogTerm = rf.ReadLog(args.PrevLogIndex).Term
 		}
 
 		reply := &AppendEntriesReply{}
@@ -577,7 +582,7 @@ func (rf *Raft) execAppendEntries(server int, index int, wg *sync.WaitGroup) {
 			found := false
 			if reply.ConflictTerm != -1 {
 				for i := args.PrevLogIndex; i >= 0; i-- {
-					if t := rf.readLog(i).Term; t == reply.ConflictTerm {
+					if t := rf.ReadLog(i).Term; t == reply.ConflictTerm {
 						rf.setNextIndex(server, i+1)
 						found = true
 						break
@@ -629,7 +634,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	lastLogIndex := rf.getLogLen() - 1
-	lastLogTerm := rf.readLog(lastLogIndex).Term
+	lastLogTerm := rf.ReadLog(lastLogIndex).Term
 	if args.LastLogTerm < lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
 		return
@@ -677,12 +682,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictTerm = -1
 		return
 	} else {
-		lastLogTerm = rf.readLog(lastLogIndex).Term
-		t := rf.readLog(args.PrevLogIndex).Term
+		lastLogTerm = rf.ReadLog(lastLogIndex).Term
+		t := rf.ReadLog(args.PrevLogIndex).Term
 		if t != args.PrevLogTerm {
 			reply.ConflictTerm = t
 			for i := args.PrevLogIndex; i >= 0; i-- {
-				if rf.readLog(i).Term != t {
+				if rf.ReadLog(i).Term != t {
 					reply.ConflictIndex = i + 1
 					break
 				}
@@ -699,7 +704,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				if nextLogIndex > len(rf.log)-1 {
 					break
 				}
-				nextLogTerm := rf.readLog(nextLogIndex).Term
+				nextLogTerm := rf.ReadLog(nextLogIndex).Term
 				if nextLogTerm != args.Entries[nextIndex].Term {
 					rf.trimRightLog(nextLogIndex)
 					rf.persist()
@@ -790,7 +795,7 @@ func (rf *Raft) checkMatchIndex() {
 		nServer := len(rf.peers)
 		majorities := nServer/2 + 1
 		for n := rf.getCommitIndex() + 1; n <= lastLogIndex; n++ {
-			if rf.readLog(n).Term != currentTerm {
+			if rf.ReadLog(n).Term != currentTerm {
 				continue
 			}
 			count := 1
