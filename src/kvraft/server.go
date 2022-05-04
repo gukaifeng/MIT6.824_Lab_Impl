@@ -1,12 +1,14 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
 	"log"
-	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
@@ -18,11 +20,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Operation string
+	ClientId  int
+	Seq       int
 }
 
 type KVServer struct {
@@ -35,15 +41,106 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	db              map[string]string
+	clientLastApply map[int]int
 }
 
+func (kv *KVServer) get(key string) (string, bool) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if v, ok := kv.db[key]; ok {
+		return v, true
+	}
+	return "", false
+}
+
+func (kv *KVServer) apply() {
+	for {
+		c := (<-kv.applyCh).Command.(Op)
+
+		if c.Seq <= kv.clientLastApply[c.ClientId] {
+			continue
+		}
+
+		k := c.Key
+		v := c.Value
+		op := c.Operation
+
+		kv.mu.Lock()
+		if op == "Put" {
+			kv.db[k] = v
+		} else {
+			kv.db[k] += v
+		}
+		kv.mu.Unlock()
+
+		kv.clientLastApply[c.ClientId] = c.Seq
+
+		DPrintf("kvraft %v, apply 成功 %v", kv.me, c)
+		time.Sleep(20 * time.Millisecond)
+	}
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	if _, b := kv.rf.GetState(); !b {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	entry := Op{args.Key, "", "", args.ClientId, args.Seq}
+	index, _, leader := kv.rf.Start(entry)
+	DPrintf("Get: %v", entry)
+	if !leader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	for kv.rf.GetLastApplied() < index {
+		DPrintf("Get 等待中，内容是 %v", entry)
+		time.Sleep(10 * time.Millisecond)
+		continue
+	}
+	// cmd := kv.rf.ReadLog(index).Command.(Op)
+	// if cmd.Seq == args.Seq {
+	// 	reply.Err = OK
+	// }
+
+	v, exist := kv.get(args.Key)
+	if !exist {
+		reply.Err = ErrNoKey
+		return
+	}
+
+	reply.Err = OK
+	reply.Value = v
+
+	DPrintf("Get: %v", args.Key)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	if _, b := kv.rf.GetState(); !b {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	entry := Op{args.Key, args.Value, args.Op, args.ClientId, args.Seq}
+	index, _, leader := kv.rf.Start(entry)
+	DPrintf("PutAppend: %v", entry)
+	if !leader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	for kv.rf.GetLastApplied() < index {
+		DPrintf("Append 等待中，内容是 %v", entry)
+		time.Sleep(10 * time.Millisecond)
+		continue
+	}
+	cmd := kv.rf.ReadLog(index).Command.(Op)
+	if cmd.Seq == args.Seq {
+		reply.Err = OK
+	}
+
 }
 
 //
@@ -96,6 +193,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.db = make(map[string]string)
+	kv.clientLastApply = make(map[int]int)
+
+	go kv.apply()
 
 	return kv
 }

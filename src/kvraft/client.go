@@ -1,13 +1,28 @@
 package kvraft
 
-import "../labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync"
+	"time"
 
+	"../labrpc"
+)
+
+var kvClientId int
+
+func produceClientId() int {
+	kvClientId++
+	return kvClientId
+}
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	prevLeader     int
+	clientId       int
+	nextRequestSeq int
+	muOperate      sync.Mutex
 }
 
 func nrand() int64 {
@@ -21,6 +36,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.prevLeader = -1
+	ck.clientId = produceClientId()
+	ck.nextRequestSeq = 1
 	return ck
 }
 
@@ -39,6 +57,40 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+
+	// ck.muOperate.Lock()
+	// defer ck.muOperate.Unlock()
+
+	args := &GetArgs{key, ck.clientId, ck.nextRequestSeq}
+
+	for {
+		reply := &GetReply{}
+
+		if ck.prevLeader == -1 {
+			ck.prevLeader = int(nrand()) % len(ck.servers)
+		}
+
+		// ok := ck.servers[ck.prevLeader].Call("KVServer.Get", args, reply)
+		var ok bool
+		t0 := time.Now()
+		go ck.sendGet(ck.prevLeader, args, reply, &ok)
+
+		for time.Since(t0).Milliseconds() < 100 {
+			if ok {
+				break
+			}
+		}
+
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.prevLeader = -1
+		} else if reply.Err == OK {
+			ck.nextRequestSeq++
+			return reply.Value
+		} else {
+			break
+		}
+	}
+
 	return ""
 }
 
@@ -53,7 +105,38 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+
 	// You will have to modify this function.
+	// ck.muOperate.Lock()
+	// defer ck.muOperate.Unlock()
+
+	args := &PutAppendArgs{key, value, op, ck.clientId, ck.nextRequestSeq}
+
+	for {
+		DPrintf("客户端尝试 k = %v, v = %v, op = %v", key, value, op)
+		reply := &PutAppendReply{}
+		if ck.prevLeader == -1 {
+			ck.prevLeader = int(nrand()) % len(ck.servers)
+		}
+
+		// ok := ck.servers[ck.prevLeader].Call("KVServer.PutAppend", args, reply)
+		var ok bool
+		t0 := time.Now()
+		go ck.sendPutAppend(ck.prevLeader, args, reply, &ok)
+
+		for time.Since(t0).Milliseconds() < 100 {
+			if ok {
+				break
+			}
+		}
+
+		if !ok || reply.Err == ErrWrongLeader {
+			ck.prevLeader = -1
+		} else if reply.Err == OK {
+			ck.nextRequestSeq++
+			break
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
@@ -61,4 +144,12 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) sendGet(server int, args *GetArgs, reply *GetReply, ok *bool) {
+	*ok = ck.servers[server].Call("KVServer.Get", args, reply)
+}
+
+func (ck *Clerk) sendPutAppend(server int, args *PutAppendArgs, reply *PutAppendReply, ok *bool) {
+	*ok = ck.servers[server].Call("KVServer.PutAppend", args, reply)
 }
