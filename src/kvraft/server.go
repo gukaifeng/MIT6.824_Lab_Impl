@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -42,6 +43,7 @@ type KVServer struct {
 
 	// Your definitions here.
 	db              map[string]string
+	lastIndex       int
 	clientLastApply map[int]int
 }
 
@@ -55,29 +57,59 @@ func (kv *KVServer) get(key string) (string, bool) {
 }
 
 func (kv *KVServer) apply() {
-	for {
-		c := (<-kv.applyCh).Command.(Op)
+	for !kv.killed() {
+		msg := <-kv.applyCh
 
-		if c.Seq <= kv.clientLastApply[c.ClientId] {
-			continue
+		if msg.CommandValid {
+			c := msg.Command.(Op)
+
+			if c.Seq <= kv.clientLastApply[c.ClientId] {
+				continue
+			}
+
+			kv.mu.Lock()
+			if c.Operation == "Put" {
+				kv.db[c.Key] = c.Value
+			} else {
+				kv.db[c.Key] += c.Value
+			}
+			kv.lastIndex = msg.CommandIndex
+			kv.mu.Unlock()
+
+			kv.clientLastApply[c.ClientId] = c.Seq
+
+			DPrintf("kvraft %v, apply 成功 %v", kv.me, c)
+		} else if msg.SnapshotValid {
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+				r := bytes.NewBuffer(msg.Snapshot)
+				d := labgob.NewDecoder(r)
+
+				var db map[string]string
+				if d.Decode(&db) != nil {
+					return
+				} else {
+					kv.db = db
+				}
+			}
 		}
 
-		k := c.Key
-		v := c.Value
-		op := c.Operation
-
-		kv.mu.Lock()
-		if op == "Put" {
-			kv.db[k] = v
-		} else {
-			kv.db[k] += v
-		}
-		kv.mu.Unlock()
-
-		kv.clientLastApply[c.ClientId] = c.Seq
-
-		DPrintf("kvraft %v, apply 成功 %v", kv.me, c)
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (kv *KVServer) makeSnapshot() {
+	for !kv.killed() {
+		if kv.rf.GetRaftStateSize() > int(float64(kv.maxraftstate)*0.8) {
+			kv.mu.Lock()
+			w := new(bytes.Buffer)
+			s := labgob.NewEncoder(w)
+			s.Encode(kv.db)
+			data := w.Bytes()
+			go kv.rf.Snapshot(kv.lastIndex, data)
+			kv.mu.Unlock()
+			time.Sleep(250 * time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -197,6 +229,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clientLastApply = make(map[int]int)
 
 	go kv.apply()
+	// go kv.makeSnapshot()
 
 	return kv
 }
